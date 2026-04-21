@@ -3,11 +3,9 @@
 #include <xinput.h>
 
 #include <atomic>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
 
 namespace {
 
@@ -21,41 +19,11 @@ constexpr uintptr_t kPlayContextMusicRva = 0x202C8;
 std::atomic<bool> g_running{true};
 DWORD g_hotkey = kDefaultHotkey;
 WORD g_controller_mask = kDefaultControllerMask;
-char g_log_path[MAX_PATH] = {};
 
 using XInputGetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
 XInputGetStateFn g_xinput_get_state = nullptr;
 
 using VoidFn = void(__cdecl*)();
-
-void Log(const char* fmt, ...)
-{
-    FILE* file = nullptr;
-    if (fopen_s(&file, g_log_path, "a") != 0 || file == nullptr) {
-        return;
-    }
-
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    std::fprintf(
-        file,
-        "[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
-        st.wYear,
-        st.wMonth,
-        st.wDay,
-        st.wHour,
-        st.wMinute,
-        st.wSecond,
-        st.wMilliseconds
-    );
-
-    va_list args;
-    va_start(args, fmt);
-    std::vfprintf(file, fmt, args);
-    va_end(args);
-    std::fprintf(file, "\n");
-    std::fclose(file);
-}
 
 DWORD LoadHotkey(const char* key_name, DWORD default_value)
 {
@@ -127,12 +95,10 @@ bool InitXInput()
         auto proc = reinterpret_cast<XInputGetStateFn>(GetProcAddress(module, "XInputGetState"));
         if (proc != nullptr) {
             g_xinput_get_state = proc;
-            Log("XInput initialized from %s", dll_name);
             return true;
         }
     }
 
-    Log("XInput unavailable");
     return false;
 }
 
@@ -140,19 +106,11 @@ void SkipCurrentTrack()
 {
     auto* const base = reinterpret_cast<std::uint8_t*>(GetModuleHandleA(nullptr));
     if (base == nullptr) {
-        Log("Skip aborted: game module base not found");
         return;
     }
 
     auto stop_music = reinterpret_cast<VoidFn>(base + kStopMusicRva);
     auto play_context_music = reinterpret_cast<VoidFn>(base + kPlayContextMusicRva);
-
-    Log(
-        "Skip requested: base=%p stop=%p context=%p",
-        base,
-        stop_music,
-        play_context_music
-    );
 
     stop_music();
     Sleep(25);
@@ -161,20 +119,14 @@ void SkipCurrentTrack()
 
 DWORD WINAPI HotkeyThread(LPVOID)
 {
-    Log(
-        "Hotkey thread started, hotkey_vk=%lu controller_mask=0x%04X",
-        static_cast<unsigned long>(g_hotkey),
-        static_cast<unsigned>(g_controller_mask)
-    );
-
     DWORD last_trigger = 0;
     bool was_down = false;
     bool controller_was_down[4] = {false, false, false, false};
 
     while (g_running.load()) {
         const DWORD now = GetTickCount();
-        const bool is_down = (GetAsyncKeyState(static_cast<int>(g_hotkey)) & 0x8000) != 0;
 
+        const bool is_down = (GetAsyncKeyState(static_cast<int>(g_hotkey)) & 0x8000) != 0;
         if (is_down && !was_down && now - last_trigger >= kCooldownMs) {
             last_trigger = now;
             SkipCurrentTrack();
@@ -194,7 +146,6 @@ DWORD WINAPI HotkeyThread(LPVOID)
                 const bool controller_down = (state.Gamepad.wButtons & g_controller_mask) == g_controller_mask;
                 if (controller_down && !controller_was_down[i] && now - last_trigger >= kCooldownMs) {
                     last_trigger = now;
-                    Log("Controller trigger on pad %lu", static_cast<unsigned long>(i));
                     SkipCurrentTrack();
                 }
 
@@ -205,7 +156,6 @@ DWORD WINAPI HotkeyThread(LPVOID)
         Sleep(kPollSleepMs);
     }
 
-    Log("Hotkey thread stopping");
     return 0;
 }
 
@@ -217,35 +167,17 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(module);
 
-        if (GetModuleFileNameA(nullptr, g_log_path, MAX_PATH) == 0) {
-            std::snprintf(g_log_path, MAX_PATH, "fo2_skip_track.log");
-        } else {
-            char* slash = std::strrchr(g_log_path, '\\');
-            if (slash != nullptr) {
-                slash[1] = '\0';
-                std::snprintf(
-                    g_log_path + std::strlen(g_log_path),
-                    MAX_PATH - std::strlen(g_log_path),
-                    "fo2_skip_track.log"
-                );
-            }
-        }
-
         g_hotkey = LoadHotkey("hotkey_vk", kDefaultHotkey);
         g_controller_mask = LoadControllerMask();
         InitXInput();
-        Log("DLL attached");
         const HANDLE thread = CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
         if (thread != nullptr) {
             CloseHandle(thread);
-        } else {
-            Log("CreateThread failed: %lu", static_cast<unsigned long>(GetLastError()));
         }
         return TRUE;
     }
     case DLL_PROCESS_DETACH:
         g_running.store(false);
-        Log("DLL detached");
         return TRUE;
     default:
         return TRUE;
