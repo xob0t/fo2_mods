@@ -1,6 +1,6 @@
 # FO2 Skip Track
 
-`FO2 Skip Track` is a small ASI plugin for `FlatOut 2` that restarts the current music selection from a single button press.
+`FO2 Skip Track` is a small ASI plugin for `FlatOut 2` that skips the current music track from a single button press.
 
 ## Quick Start
 
@@ -21,14 +21,14 @@ It supports:
 
 ## What It Does
 
-The plugin hooks into the running game process, calls native music restart functions discovered in the `FlatOut2.exe` binary, and exposes that behavior through a configurable hotkey and controller binding.
+The plugin hooks into the running game process, calls native music control functions discovered in the `FlatOut2.exe` binary, and exposes that behavior through a configurable hotkey and controller binding.
 
 Current default behavior:
 
 - keyboard: `N`
 - controller: `LEFT_SHOULDER`
 
-When triggered, the plugin requests both gameplay and title/menu music restart paths. In practice this gives one shared skip action that works across game contexts.
+When triggered, the plugin requests fresh playback for the next music selection across gameplay and title/menu contexts. In practice this gives one shared skip action that works across game contexts.
 
 ## Install
 
