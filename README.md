@@ -2,11 +2,17 @@
 
 `FO2 Skip Track` is a small ASI plugin for `FlatOut 2` that restarts the current music selection from a single button press.
 
+## Quick Start
+
+1. Download the latest 32-bit [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
+2. Put `winmm.dll` in your `FlatOut 2` folder next to `FlatOut2.exe`.
+3. Copy `fo2_skip_track.asi` and `fo2_skip_track.ini` into the same folder.
+4. Launch the game and press `N` or `LEFT_SHOULDER`.
+
 It supports:
 
 - keyboard trigger with `N` by default
 - direct XInput controller trigger with `LEFT_SHOULDER` by default
-- no keyboard emulation required for controller use, so it avoids forcing the game back to keyboard input mode
 
 ## What It Does
 
@@ -49,7 +55,19 @@ Copy these files into the `FlatOut 2` game root:
 - `fo2_skip_track.asi`
 - `fo2_skip_track.ini`
 
-This plugin expects an ASI loader to already be present. In my setup, the existing local `winmm.dll` loader handled this.
+This plugin requires an ASI loader.
+
+Recommended loader:
+
+- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)
+
+For the Steam version of `FlatOut 2`, use the 32-bit release and place `winmm.dll` in the game root next to `FlatOut2.exe`.
+
+Install summary:
+
+1. Download the latest 32-bit `Ultimate ASI Loader` release from [ThirteenAG/Ultimate-ASI-Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
+2. Extract `winmm.dll` into the `FlatOut 2` game folder.
+3. Copy `fo2_skip_track.asi` and `fo2_skip_track.ini` into the same folder.
 
 ## Config
 
@@ -101,16 +119,4 @@ Supported names:
 - The plugin is built for the 32-bit Steam version of `FlatOut 2`.
 - It was tested locally with direct XInput polling.
 - Function RVAs are currently hardcoded for the tested executable build. If the game executable changes, those addresses may need updating.
-
-## Status
-
-Working in my local test setup:
-
-- plugin loads successfully
-- keyboard trigger works
-- controller trigger works
-- controller trigger does not force the game back to keyboard input mode
-
-## License
-
-No license selected yet.
+- The recommended loader setup uses `Ultimate ASI Loader` as `winmm.dll`.

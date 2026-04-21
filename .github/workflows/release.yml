@@ -1,0 +1,42 @@
+name: Build And Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Plugin
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+      - name: Prepare Release Files
+        shell: powershell
+        run: |
+          $releaseDir = Join-Path $PWD "release"
+          New-Item -ItemType Directory -Force $releaseDir | Out-Null
+
+          Copy-Item .\fo2_skip_track.asi $releaseDir
+          Copy-Item .\fo2_skip_track.ini $releaseDir
+          Copy-Item .\README.md $releaseDir
+
+          $zipName = "fo2_skip_track-${{ github.ref_name }}.zip"
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            fo2_skip_track-${{ github.ref_name }}.zip
