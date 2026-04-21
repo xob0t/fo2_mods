@@ -24,16 +24,8 @@ jobs:
       - name: Download Ultimate ASI Loader
         shell: powershell
         run: |
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ThirteenAG/Ultimate-ASI-Loader/releases/latest"
-          $asset = $release.assets | Where-Object {
-            $_.name -match 'x86|win32|32' -and $_.name -match '\.zip$'
-          } | Select-Object -First 1
-
-          if (-not $asset) {
-            throw "Could not find a 32-bit Ultimate ASI Loader zip asset."
-          }
-
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ".\ultimate-asi-loader.zip"
+          $assetUrl = "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/Win32-latest/wininet-Win32.zip"
+          Invoke-WebRequest -Uri $assetUrl -OutFile ".\ultimate-asi-loader.zip"
           Expand-Archive -Path ".\ultimate-asi-loader.zip" -DestinationPath ".\ultimate-asi-loader" -Force
 
           $winmm = Get-ChildItem ".\ultimate-asi-loader" -Recurse -Filter "winmm.dll" | Select-Object -First 1
