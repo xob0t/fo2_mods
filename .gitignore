@@ -6,3 +6,4 @@
 *.log
 *.dll
 *.asi
+!third_party/winmm.dll

@@ -93,6 +93,7 @@ Supported names:
 
 - The plugin is built for the 32-bit Steam version of `FlatOut 2`.
 - It was tested locally with direct XInput polling.
+- The bundled `winmm.dll` is a pinned known-good Ultimate ASI Loader build. Newer loader builds caused crashes in local `FlatOut 2` testing.
 - Function RVAs are currently hardcoded for the tested executable build. If the game executable changes, those addresses may need updating.
 
 ## Building From Source
