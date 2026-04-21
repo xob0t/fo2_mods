@@ -4,16 +4,15 @@
 
 ## Quick Start
 
-1. Download the latest 32-bit [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
-2. Put `winmm.dll` in your `FlatOut 2` folder next to `FlatOut2.exe`.
-3. Copy `fo2_skip_track.asi` and `fo2_skip_track.ini` into the same folder.
-4. Launch the game and press `N` or `LEFT_SHOULDER`.
+1. Download the latest release zip from this repo.
+2. Extract `fo2_skip_track.asi`, `fo2_skip_track.ini`, and `winmm.dll` into your `FlatOut 2` folder next to `FlatOut2.exe`.
+3. Launch the game and press `N` or `LEFT_SHOULDER`.
 
-GitHub release zips produced by this repo include:
+GitHub release zips include:
 
 - `fo2_skip_track.asi`
 - `fo2_skip_track.ini`
-- `winmm.dll` from the latest 32-bit [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)
+- `winmm.dll`
 
 It supports:
 
@@ -31,51 +30,19 @@ Current default behavior:
 
 When triggered, the plugin requests both gameplay and title/menu music restart paths. In practice this gives one shared skip action that works across game contexts.
 
-## Files
-
-- `fo2_skip_track.cpp`: plugin source
-- `build.ps1`: 32-bit build script for Visual Studio Build Tools
-- `fo2_skip_track.ini`: sample runtime config
-
-## Build
-
-Requirements:
-
-- Visual Studio 2022 Build Tools with x86 C++ tools installed
-
-Build from PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
-```
-
-The build script creates:
-
-- `fo2_skip_track.dll`
-- `fo2_skip_track.asi`
-
 ## Install
 
-Copy these files into the `FlatOut 2` game root:
+Recommended:
 
-- `fo2_skip_track.asi`
-- `fo2_skip_track.ini`
+- use the GitHub release zip
+- extract everything into the `FlatOut 2` game root
+- no separate loader download is needed because the release zip includes `winmm.dll`
 
-This plugin requires an ASI loader.
+Manual route:
 
-Recommended loader:
-
-- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)
-
-For the Steam version of `FlatOut 2`, use the 32-bit release and place `winmm.dll` in the game root next to `FlatOut2.exe`.
-
-Install summary:
-
-1. Download the latest 32-bit `Ultimate ASI Loader` release from [ThirteenAG/Ultimate-ASI-Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
+1. Download the latest 32-bit [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
 2. Extract `winmm.dll` into the `FlatOut 2` game folder.
 3. Copy `fo2_skip_track.asi` and `fo2_skip_track.ini` into the same folder.
-
-If you are using a packaged GitHub release from this repo, `winmm.dll` is already included in the zip.
 
 ## Config
 
@@ -127,4 +94,26 @@ Supported names:
 - The plugin is built for the 32-bit Steam version of `FlatOut 2`.
 - It was tested locally with direct XInput polling.
 - Function RVAs are currently hardcoded for the tested executable build. If the game executable changes, those addresses may need updating.
-- The recommended loader setup uses `Ultimate ASI Loader` as `winmm.dll`.
+
+## Building From Source
+
+Files:
+
+- `fo2_skip_track.cpp`: plugin source
+- `build.ps1`: 32-bit build script for Visual Studio Build Tools
+- `fo2_skip_track.ini`: sample runtime config
+
+Requirements:
+
+- Visual Studio 2022 Build Tools with x86 C++ tools installed
+
+Build from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+The build script creates:
+
+- `fo2_skip_track.dll`
+- `fo2_skip_track.asi`
