@@ -24,16 +24,16 @@ jobs:
       - name: Download Ultimate ASI Loader
         shell: powershell
         run: |
-          $assetUrl = "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/Win32-latest/wininet-Win32.zip"
+          $assetUrl = "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/Win32-latest/winmm-Win32.zip"
           Invoke-WebRequest -Uri $assetUrl -OutFile ".\ultimate-asi-loader.zip"
           Expand-Archive -Path ".\ultimate-asi-loader.zip" -DestinationPath ".\ultimate-asi-loader" -Force
 
-          $winmm = Get-ChildItem ".\ultimate-asi-loader" -Recurse -Filter "winmm.dll" | Select-Object -First 1
-          if (-not $winmm) {
+          $winmm = ".\ultimate-asi-loader\winmm.dll"
+          if (-not (Test-Path $winmm)) {
             throw "Could not find winmm.dll in the downloaded Ultimate ASI Loader archive."
           }
 
-          Copy-Item $winmm.FullName ".\winmm.dll"
+          Copy-Item $winmm ".\winmm.dll"
 
       - name: Prepare Release Files
         shell: powershell
