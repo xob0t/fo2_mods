@@ -16,8 +16,7 @@ constexpr DWORD kCooldownMs = 600;
 constexpr DWORD kDefaultHotkey = 'N';
 constexpr WORD kDefaultControllerMask = XINPUT_GAMEPAD_LEFT_SHOULDER;
 constexpr uintptr_t kStopMusicRva = 0x20270;
-constexpr uintptr_t kPlayTitleMusicRva = 0x20230;
-constexpr uintptr_t kPlayGameplayMusicRva = 0x202C8;
+constexpr uintptr_t kPlayContextMusicRva = 0x202C8;
 
 std::atomic<bool> g_running{true};
 DWORD g_hotkey = kDefaultHotkey;
@@ -137,47 +136,27 @@ bool InitXInput()
     return false;
 }
 
-void RestartGameplayMusic()
+void SkipCurrentTrack()
 {
     auto* const base = reinterpret_cast<std::uint8_t*>(GetModuleHandleA(nullptr));
     if (base == nullptr) {
-        Log("Gameplay restart aborted: game module base not found");
+        Log("Skip aborted: game module base not found");
         return;
     }
 
     auto stop_music = reinterpret_cast<VoidFn>(base + kStopMusicRva);
-    auto play_gameplay_music = reinterpret_cast<VoidFn>(base + kPlayGameplayMusicRva);
-    auto play_title_music = reinterpret_cast<VoidFn>(base + kPlayTitleMusicRva);
+    auto play_context_music = reinterpret_cast<VoidFn>(base + kPlayContextMusicRva);
 
     Log(
-        "Gameplay restart requested: base=%p stop=%p gameplay=%p title=%p",
+        "Skip requested: base=%p stop=%p context=%p",
         base,
         stop_music,
-        play_gameplay_music,
-        play_title_music
+        play_context_music
     );
 
     stop_music();
     Sleep(25);
-    play_gameplay_music();
-}
-
-void RestartTitleMusic()
-{
-    auto* const base = reinterpret_cast<std::uint8_t*>(GetModuleHandleA(nullptr));
-    if (base == nullptr) {
-        Log("Title restart aborted: game module base not found");
-        return;
-    }
-
-    auto stop_music = reinterpret_cast<VoidFn>(base + kStopMusicRva);
-    auto play_title_music = reinterpret_cast<VoidFn>(base + kPlayTitleMusicRva);
-
-    Log("Title restart requested: base=%p stop=%p title=%p", base, stop_music, play_title_music);
-
-    stop_music();
-    Sleep(25);
-    play_title_music();
+    play_context_music();
 }
 
 DWORD WINAPI HotkeyThread(LPVOID)
@@ -198,8 +177,7 @@ DWORD WINAPI HotkeyThread(LPVOID)
 
         if (is_down && !was_down && now - last_trigger >= kCooldownMs) {
             last_trigger = now;
-            RestartGameplayMusic();
-            RestartTitleMusic();
+            SkipCurrentTrack();
         }
 
         was_down = is_down;
@@ -217,8 +195,7 @@ DWORD WINAPI HotkeyThread(LPVOID)
                 if (controller_down && !controller_was_down[i] && now - last_trigger >= kCooldownMs) {
                     last_trigger = now;
                     Log("Controller trigger on pad %lu", static_cast<unsigned long>(i));
-                    RestartGameplayMusic();
-                    RestartTitleMusic();
+                    SkipCurrentTrack();
                 }
 
                 controller_was_down[i] = controller_down;
