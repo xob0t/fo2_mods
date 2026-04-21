@@ -9,6 +9,12 @@
 3. Copy `fo2_skip_track.asi` and `fo2_skip_track.ini` into the same folder.
 4. Launch the game and press `N` or `LEFT_SHOULDER`.
 
+GitHub release zips produced by this repo include:
+
+- `fo2_skip_track.asi`
+- `fo2_skip_track.ini`
+- `winmm.dll` from the latest 32-bit [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)
+
 It supports:
 
 - keyboard trigger with `N` by default
@@ -68,6 +74,8 @@ Install summary:
 1. Download the latest 32-bit `Ultimate ASI Loader` release from [ThirteenAG/Ultimate-ASI-Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
 2. Extract `winmm.dll` into the `FlatOut 2` game folder.
 3. Copy `fo2_skip_track.asi` and `fo2_skip_track.ini` into the same folder.
+
+If you are using a packaged GitHub release from this repo, `winmm.dll` is already included in the zip.
 
 ## Config
 

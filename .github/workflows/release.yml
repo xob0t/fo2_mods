@@ -21,6 +21,28 @@ jobs:
         run: |
           powershell -ExecutionPolicy Bypass -File .\build.ps1
 
+      - name: Download Ultimate ASI Loader
+        shell: powershell
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ThirteenAG/Ultimate-ASI-Loader/releases/latest"
+          $asset = $release.assets | Where-Object {
+            $_.name -match 'x86|win32|32' -and $_.name -match '\.zip$'
+          } | Select-Object -First 1
+
+          if (-not $asset) {
+            throw "Could not find a 32-bit Ultimate ASI Loader zip asset."
+          }
+
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ".\ultimate-asi-loader.zip"
+          Expand-Archive -Path ".\ultimate-asi-loader.zip" -DestinationPath ".\ultimate-asi-loader" -Force
+
+          $winmm = Get-ChildItem ".\ultimate-asi-loader" -Recurse -Filter "winmm.dll" | Select-Object -First 1
+          if (-not $winmm) {
+            throw "Could not find winmm.dll in the downloaded Ultimate ASI Loader archive."
+          }
+
+          Copy-Item $winmm.FullName ".\winmm.dll"
+
       - name: Prepare Release Files
         shell: powershell
         run: |
@@ -29,6 +51,7 @@ jobs:
 
           Copy-Item .\fo2_skip_track.asi $releaseDir
           Copy-Item .\fo2_skip_track.ini $releaseDir
+          Copy-Item .\winmm.dll $releaseDir
           Copy-Item .\README.md $releaseDir
 
           $zipName = "fo2_skip_track-${{ github.ref_name }}.zip"
