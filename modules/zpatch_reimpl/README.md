@@ -1,58 +1,62 @@
 # FO2 ZPatch Reimplementation
 
-Clean reimplementation experiment for selected `ZPatchFO2_v2.4` features on the current Steam `FlatOut 2` executable.
+ASI reimplementation of selected `ZPatchFO2_v2.4` patches for the current Steam version of `FlatOut 2`.
 
-The goal is not to ship the old replacement exe. Current Steam `FlatOut2.exe` is already OpenSpy-patched, while the old ZPatch package includes an older exe that still contains `gamespy.com` strings. This project should target the installed Steam exe with runtime ASI patches and pattern scans where practical.
+## Install
 
-## Initial Scope
-
-First-pass targets:
-
-- `SkipIntro`
-- `UncapFPS`
-- `FramePacingFix`
-- `RemoveVSync`
-- `BorderlessWindowed`
-- `WidescreenFix`
-- Menu car file-size limits
-- Menu car backface culling
-
-Later / harder targets:
-
-- `WidescreenFix_FOVScaling`
-- Splitscreen menu/fix support
-
-## Install For Testing
-
-Copy these next to `FlatOut2.exe`:
+Copy these files next to `FlatOut2.exe`:
 
 - `fo2_zpatch_reimpl.asi`
 - `fo2_zpatch_reimpl.ini`
+- `winmm.dll`
 
-Requires an ASI loader such as the existing `winmm.dll` / Ultimate ASI Loader setup.
+`winmm.dll` is the Ultimate ASI Loader. It is included in release packages.
 
-Recommended performance setting:
+## Reimplemented Patches
+
+- `SkipIntro`: skips the startup intro videos.
+- `UncapFPS`: bypasses the render gate while keeping the original game timing interval intact.
+- `RemoveVSync`: requests immediate D3D9 presentation.
+- `BorderlessWindowed`: optional borderless windowed mode.
+- `WidescreenFix`: patches widescreen menu/layout scaling for modern aspect ratios.
+- `WidescreenFix_FOVScaling`: patches garage/race camera FOV and projection behavior for widescreen and ultrawide displays.
+
+## New Patches
+
+- `FramePacingFix`: removes the stock frame limiter's `Sleep(1)` yield and requests 1 ms timer resolution. This patch is not from original ZPatchFO2. It is included to reduce uneven pacing on modern Windows while preserving the original timing interval.
+
+## Omitted Patches
+
+- `UseOpenSpy`: omitted because the current Steam executable already uses OpenSpy.
+- `TryToSkipAllErrors`: omitted because blindly skipping game errors is risky and can hide real crashes or data problems.
+- `SplitscreenFix`: not implemented.
+- Menu car file-size limit patches: not implemented.
+- Menu car backface-culling patch: not implemented.
+
+`SplitscreenFix`, `MenuCarMaxModelFileSize`, `MenuCarMaxSkinFileSize`, and `MenuCarBackfaceCulling` may still appear in the config for compatibility with earlier local builds, but they are not active patches.
+
+## Default Config
 
 ```ini
+[General]
+Log=1
+
+[Fixes]
+SkipIntro=1
 UncapFPS=1
 FramePacingFix=1
+RemoveVSync=1
+BorderlessWindowed=0
+WidescreenFix=1
+WidescreenFix_FOVScaling=1
+SplitscreenFix=0
+MenuCarMaxModelFileSize=524288
+MenuCarMaxSkinFileSize=2097152
+MenuCarBackfaceCulling=1
 ```
-
-`FramePacingFix` removes the old limiter's `Sleep(1)` yield, which can cause visible 50 FPS-like pacing dips on modern Windows. `UncapFPS` keeps the stock timing interval intact and only bypasses the render gate. `FPSLimit` is intentionally not included: changing the game's frame-gate interval can speed up simulation, and the D3D Present-based limiter only worked reliably through `dxwrapper.dll`, which hurt pacing in testing.
 
 ## Build
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
-
-## Research Notes
-
-Observed from `D:\SteamLibrary\steamapps\common\FlatOut2\ZPatchFO2_v2.4`:
-
-- `ZPatchFO2.asi` is a 32-bit ASI with minimal imports: `VirtualProtect`, basic file APIs, and a few `USER32` window APIs.
-- `ZPatchFO2.ini` exposes the feature list we are cloning behaviorally.
-- `ZPatchFO2BFS` contains `splitscreen.bfs`.
-- The bundled `FlatOut2.exe` differs from the installed Steam exe mostly in OpenSpy/GameSpy strings and trailing overlay/signature data.
-- Installed Steam exe already uses `openspy.net`; bundled old exe uses `gamespy.com`.
-- Therefore `UseOpenSpy` should be treated as already handled for current Steam builds, or implemented as a compatibility fallback later.
