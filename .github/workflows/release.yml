@@ -41,25 +41,65 @@ jobs:
             }
           }
 
-      - name: Prepare Release Zip
+      - name: Prepare Release Zips
         shell: powershell
         run: |
-          $releaseDir = Join-Path $PWD "release"
-          New-Item -ItemType Directory -Force $releaseDir | Out-Null
+          $packages = @(
+            @{
+              Name = "fo2_zpatch_reimpl"
+              Files = @(
+                ".\dist\winmm.dll",
+                ".\dist\fo2_zpatch_reimpl.asi",
+                ".\dist\fo2_zpatch_reimpl.ini",
+                ".\LICENSE",
+                ".\modules\zpatch_reimpl\README.md"
+              )
+            },
+            @{
+              Name = "fo2_xinput_rumble"
+              Files = @(
+                ".\dist\dinput8.dll",
+                ".\dist\fo2_xinput_rumble.ini",
+                ".\LICENSE",
+                ".\modules\xinput_rumble\README.md"
+              )
+            },
+            @{
+              Name = "fo2_skip_track"
+              Files = @(
+                ".\dist\winmm.dll",
+                ".\dist\fo2_skip_track.asi",
+                ".\dist\fo2_skip_track.ini",
+                ".\LICENSE",
+                ".\modules\skip_track\README.md"
+              )
+            }
+          )
 
-          Copy-Item .\dist\* $releaseDir -Force
-          Copy-Item .\README.md $releaseDir -Force
-          Copy-Item .\LICENSE $releaseDir -Force
+          foreach ($package in $packages) {
+            $releaseDir = Join-Path $PWD ("release-" + $package.Name)
+            New-Item -ItemType Directory -Force $releaseDir | Out-Null
 
-          $zipName = "fo2_mods-${{ github.ref_name }}.zip"
-          Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
+            foreach ($file in $package.Files) {
+              if (-not (Test-Path -LiteralPath $file)) {
+                throw "Missing package input: $file"
+              }
+              Copy-Item -LiteralPath $file -Destination $releaseDir -Force
+            }
+
+            $zipName = "$($package.Name)-${{ github.ref_name }}.zip"
+            Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
+          }
 
       - name: Upload Test Artifact
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@v4
         with:
-          name: fo2_mods-${{ github.ref_name }}
-          path: fo2_mods-${{ github.ref_name }}.zip
+          name: fo2_mods-${{ github.ref_name }}-packages
+          path: |
+            fo2_zpatch_reimpl-${{ github.ref_name }}.zip
+            fo2_xinput_rumble-${{ github.ref_name }}.zip
+            fo2_skip_track-${{ github.ref_name }}.zip
 
       - name: Create GitHub Release
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -67,4 +107,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            fo2_mods-${{ github.ref_name }}.zip
+            fo2_zpatch_reimpl-${{ github.ref_name }}.zip
+            fo2_xinput_rumble-${{ github.ref_name }}.zip
+            fo2_skip_track-${{ github.ref_name }}.zip
