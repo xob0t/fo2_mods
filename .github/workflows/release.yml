@@ -1,6 +1,7 @@
 name: Build And Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -53,7 +54,15 @@ jobs:
           $zipName = "fo2_mods-${{ github.ref_name }}.zip"
           Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
 
+      - name: Upload Test Artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fo2_mods-${{ github.ref_name }}
+          path: fo2_mods-${{ github.ref_name }}.zip
+
       - name: Create GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
