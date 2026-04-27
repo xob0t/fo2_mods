@@ -1,9 +1,19 @@
+# Build outputs
 *.obj
-*.exp
 *.lib
-*.ilk
+*.exp
 *.pdb
-*.log
+*.ilk
 *.dll
 *.asi
-!third_party/winmm.dll
+
+# Keep the known-good ASI loader binary vendored.
+!third_party/UltimateASILoader/winmm.dll
+
+# Local artifacts
+dist/
+*.log
+
+# Local investigation scratch space
+captures/
+tools/
