@@ -33,8 +33,6 @@ Copy these files next to `FlatOut2.exe`:
 - Menu car file-size limit patches: not implemented.
 - Menu car backface-culling patch: not implemented.
 
-`SplitscreenFix`, `MenuCarMaxModelFileSize`, `MenuCarMaxSkinFileSize`, and `MenuCarBackfaceCulling` may still appear in the config for compatibility with earlier local builds, but they are not active patches.
-
 ## Default Config
 
 ```ini
@@ -49,10 +47,6 @@ RemoveVSync=1
 BorderlessWindowed=0
 WidescreenFix=1
 WidescreenFix_FOVScaling=1
-SplitscreenFix=0
-MenuCarMaxModelFileSize=524288
-MenuCarMaxSkinFileSize=2097152
-MenuCarBackfaceCulling=1
 ```
 
 ## Build
