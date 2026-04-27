@@ -2,9 +2,11 @@
 
 Runtime mods for the Steam version of `FlatOut 2`.
 
+Fully vibecoded, rigorously tested.
+
 ## Mods
 
-- `fo2_zpatch_reimpl`: widescreen/FOV fixes, intro skip, FPS unlock, frame pacing fix, v-sync removal, and optional borderless windowed mode.
+- `fo2_zpatch_reimpl`: widescreen/FOV fixes, intro skip, FPS unlock, frame pacing fix, v-sync removal, borderless windowed mode.
 - `fo2_xinput_rumble`: XInput controller rumble with directional feedback and gameplay-event rumble.
 - `fo2_skip_track`: music track skip from keyboard or controller.
 
@@ -18,7 +20,7 @@ ASI-based mods include `winmm.dll`, the known-good Ultimate ASI Loader build use
 - File version: `1.0.0.0`
 - Description: `Ultimate ASI Loader`
 
-Avoid `dxwrapper.dll` and DXVK with these mods unless you specifically need them. They can make frame pacing worse.
+Avoid `dxwrapper.dll` with these mods unless you specifically need it. It can make frame pacing worse.
 
 ## `fo2_zpatch_reimpl`
 
@@ -94,7 +96,7 @@ controller_buttons=LEFT_SHOULDER
 
 `78` is the Windows virtual-key code for `N`.
 
-The mod hooks FlatOut 2 music playback routines and requests a new track selection when triggered. It uses one shared skip action for menu music and race music, so pressing the configured key or controller button skips the currently playing track instead of opening sound settings or changing game input mode.
+The mod hooks FlatOut 2 music playback routines and requests a new track selection when triggered, thus skipping current track.
 
 ## Build
 
