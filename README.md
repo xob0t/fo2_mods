@@ -1,6 +1,6 @@
 # FlatOut 2 Mods
 
-Runtime mods for the Steam version of `FlatOut 2`.
+Runtime mods for `FlatOut 2`, tested on the Steam version.
 
 Fully vibecoded, rigorously tested.
 
