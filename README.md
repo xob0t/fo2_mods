@@ -1,44 +1,36 @@
 # FlatOut 2 Mods
 
-Combined source repo for the FlatOut 2 patch/mods we have been building together.
+Runtime mods for the Steam version of `FlatOut 2`.
 
-This repo keeps the three working components as separate modules, but builds and packages them as one installable set:
+## Mods
 
-- `fo2_zpatch_reimpl.asi`: selected ZPatch-style fixes for the current Steam executable.
-- `dinput8.dll`: XInput gamepad rumble proxy.
-- `fo2_skip_track.asi`: keyboard/controller music track skip.
+- `fo2_zpatch_reimpl`: widescreen/FOV fixes, intro skip, FPS unlock, frame pacing fix, v-sync removal, and optional borderless windowed mode.
+- `fo2_xinput_rumble`: XInput controller rumble with directional feedback and gameplay-event rumble.
+- `fo2_skip_track`: music track skip from keyboard or controller.
 
 ## Install
 
-Build a release package:
+Download the release zip for the mod you want, then extract it into the `FlatOut 2` folder next to `FlatOut2.exe`.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
-```
-
-Copy everything from `dist\` into the `FlatOut 2` folder next to `FlatOut2.exe`.
-
-Or install directly to the default Steam path:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1
-```
-
-The release package includes the known-good `winmm.dll` ASI loader we tested with:
+ASI-based mods include `winmm.dll`, the known-good Ultimate ASI Loader build used for this game:
 
 - SHA-256: `9A2BB218AB014FA4AD56104108C26AE48BF3E22595C126CD4F41367C799DA722`
 - File version: `1.0.0.0`
 - Description: `Ultimate ASI Loader`
 
-Avoid `dxwrapper.dll` and DXVK for now. Both made frame pacing feel worse in our testing, even when they appeared functional.
+Avoid `dxwrapper.dll` and DXVK with these mods unless you specifically need them. They can make frame pacing worse.
 
-## Components
-
-### ZPatch Reimplementation
+## `fo2_zpatch_reimpl`
 
 Source: `modules\zpatch_reimpl`
 
-Current defaults:
+Install files:
+
+- `fo2_zpatch_reimpl.asi`
+- `fo2_zpatch_reimpl.ini`
+- `winmm.dll`
+
+Default fixes:
 
 ```ini
 SkipIntro=1
@@ -50,17 +42,48 @@ WidescreenFix=1
 WidescreenFix_FOVScaling=1
 ```
 
-`FPSLimit` is intentionally not included. Changing the game's frame-gate interval sped up simulation, and the D3D Present-based limiter only worked reliably through `dxwrapper.dll`, which hurt pacing.
+Feature notes:
 
-### XInput Rumble
+- `SkipIntro` bypasses the startup intro videos.
+- `UncapFPS` unlocks rendering while keeping the original game timing interval intact.
+- `FramePacingFix` improves the stock frame gate by removing the old `Sleep(1)` yield that can cause uneven pacing on modern Windows.
+- `RemoveVSync` requests immediate D3D9 presentation.
+- `BorderlessWindowed` is available but disabled by default.
+- `WidescreenFix` and `WidescreenFix_FOVScaling` fix ultrawide/widescreen menu, garage, and race camera behavior.
+
+## `fo2_xinput_rumble`
 
 Source: `modules\xinput_rumble`
 
-Installs as `dinput8.dll` and forwards normal DirectInput calls while adding XInput rumble from player damage/contact events.
+Install files:
 
-### Skip Track
+- `dinput8.dll`
+- `fo2_xinput_rumble.ini`
+
+This is a DirectInput 8 proxy that forwards the game's normal input calls and adds XInput rumble for modern controllers.
+
+It supports:
+
+- player damage rumble
+- player contact/collision rumble
+- car-to-car impact rumble
+- object/rubble contact rumble
+- scrape/wall-hug rumble
+- rough landing feedback
+- directional rumble bias, so left/right impacts can favor the corresponding motor
+- configurable strength, duration, cooldown, envelopes, and synthetic button-test rumble
+
+The default config is tuned for an Xbox-style controller on controller index `0`.
+
+## `fo2_skip_track`
 
 Source: `modules\skip_track`
+
+Install files:
+
+- `fo2_skip_track.asi`
+- `fo2_skip_track.ini`
+- `winmm.dll`
 
 Default controls:
 
@@ -71,14 +94,36 @@ controller_buttons=LEFT_SHOULDER
 
 `78` is the Windows virtual-key code for `N`.
 
-## Build Requirements
+The mod hooks FlatOut 2 music playback routines and requests a new track selection when triggered. It uses one shared skip action for menu music and race music, so pressing the configured key or controller button skips the currently playing track instead of opening sound settings or changing game input mode.
+
+## Build
+
+Requirements:
 
 - Windows
-- Visual Studio 2022 C++ build tools with x86 toolchain
 - PowerShell
+- Visual Studio 2022 C++ build tools with the x86 toolchain
 
-Each module still has its own `build.ps1` for focused development. The top-level `build.ps1` calls all module builds and gathers the installable files into `dist\`.
+Build all mods:
 
-## Notes
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
 
-This is not a one-DLL merge yet. Keeping the modules separate is deliberate: the current combination is tested and stable, while a single binary would require careful hook-order and proxy-loader work.
+The top-level build creates `dist\` with all runtime files:
+
+- `winmm.dll`
+- `fo2_zpatch_reimpl.asi`
+- `fo2_zpatch_reimpl.ini`
+- `dinput8.dll`
+- `fo2_xinput_rumble.ini`
+- `fo2_skip_track.asi`
+- `fo2_skip_track.ini`
+
+Install the built files to the default Steam path:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Each module also has its own `build.ps1` for building only that mod.
