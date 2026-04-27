@@ -1,120 +1,84 @@
-# FO2 Skip Track
+# FlatOut 2 Mods
 
-`FO2 Skip Track` is a small ASI plugin for `FlatOut 2` that skips the current music track from a single button press.
+Combined source repo for the FlatOut 2 patch/mods we have been building together.
 
-## Quick Start
+This repo keeps the three working components as separate modules, but builds and packages them as one installable set:
 
-1. Download the latest release zip from this repo.
-2. Extract `fo2_skip_track.asi`, `fo2_skip_track.ini`, and `winmm.dll` into your `FlatOut 2` folder next to `FlatOut2.exe`.
-3. Launch the game and press `N` or `LEFT_SHOULDER`.
-
-GitHub release zips include:
-
-- `fo2_skip_track.asi`
-- `fo2_skip_track.ini`
-- `winmm.dll`
-
-It supports:
-
-- keyboard trigger with `N` by default
-- direct XInput controller trigger with `LEFT_SHOULDER` by default
-
-## What It Does
-
-The plugin hooks into the running game process, calls native music control functions discovered in the `FlatOut2.exe` binary, and exposes that behavior through a configurable hotkey and controller binding.
-
-Current default behavior:
-
-- keyboard: `N`
-- controller: `LEFT_SHOULDER`
-
-When triggered, the plugin requests fresh playback for the next music selection across gameplay and title/menu contexts. In practice this gives one shared skip action that works across game contexts.
+- `fo2_zpatch_reimpl.asi`: selected ZPatch-style fixes for the current Steam executable.
+- `dinput8.dll`: XInput gamepad rumble proxy.
+- `fo2_skip_track.asi`: keyboard/controller music track skip.
 
 ## Install
 
-Recommended:
-
-- use the GitHub release zip
-- extract everything into the `FlatOut 2` game root
-- no separate loader download is needed because the release zip includes `winmm.dll`
-
-Manual route:
-
-1. Download the latest 32-bit [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases).
-2. Extract `winmm.dll` into the `FlatOut 2` game folder.
-3. Copy `fo2_skip_track.asi` and `fo2_skip_track.ini` into the same folder.
-
-## Config
-
-Example:
-
-```ini
-[skip_track]
-hotkey_vk=78
-controller_buttons=LEFT_SHOULDER
-```
-
-### `hotkey_vk`
-
-Windows virtual-key code for the keyboard trigger.
-
-Default:
-
-- `78` for `N`
-
-### `controller_buttons`
-
-One or more XInput button names joined with `+`.
-
-Examples:
-
-- `LEFT_SHOULDER`
-- `BACK+RIGHT_SHOULDER`
-- `Y`
-
-Supported names:
-
-- `A`
-- `B`
-- `X`
-- `Y`
-- `BACK`
-- `START`
-- `LEFT_SHOULDER`
-- `RIGHT_SHOULDER`
-- `LEFT_THUMB`
-- `RIGHT_THUMB`
-- `DPAD_UP`
-- `DPAD_DOWN`
-- `DPAD_LEFT`
-- `DPAD_RIGHT`
-
-## Notes
-
-- The plugin is built for the 32-bit Steam version of `FlatOut 2`.
-- It was tested locally with direct XInput polling.
-- The bundled `winmm.dll` is a pinned known-good Ultimate ASI Loader build. Newer loader builds caused crashes in local `FlatOut 2` testing.
-- Function RVAs are currently hardcoded for the tested executable build. If the game executable changes, those addresses may need updating.
-
-## Building From Source
-
-Files:
-
-- `fo2_skip_track.cpp`: plugin source
-- `build.ps1`: 32-bit build script for Visual Studio Build Tools
-- `fo2_skip_track.ini`: sample runtime config
-
-Requirements:
-
-- Visual Studio 2022 Build Tools with x86 C++ tools installed
-
-Build from PowerShell:
+Build a release package:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-The build script creates:
+Copy everything from `dist\` into the `FlatOut 2` folder next to `FlatOut2.exe`.
 
-- `fo2_skip_track.dll`
-- `fo2_skip_track.asi`
+Or install directly to the default Steam path:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The release package includes the known-good `winmm.dll` ASI loader we tested with:
+
+- SHA-256: `9A2BB218AB014FA4AD56104108C26AE48BF3E22595C126CD4F41367C799DA722`
+- File version: `1.0.0.0`
+- Description: `Ultimate ASI Loader`
+
+Avoid `dxwrapper.dll` and DXVK for now. Both made frame pacing feel worse in our testing, even when they appeared functional.
+
+## Components
+
+### ZPatch Reimplementation
+
+Source: `modules\zpatch_reimpl`
+
+Current defaults:
+
+```ini
+SkipIntro=1
+UncapFPS=1
+FramePacingFix=1
+RemoveVSync=1
+BorderlessWindowed=0
+WidescreenFix=1
+WidescreenFix_FOVScaling=1
+```
+
+`FPSLimit` is intentionally not included. Changing the game's frame-gate interval sped up simulation, and the D3D Present-based limiter only worked reliably through `dxwrapper.dll`, which hurt pacing.
+
+### XInput Rumble
+
+Source: `modules\xinput_rumble`
+
+Installs as `dinput8.dll` and forwards normal DirectInput calls while adding XInput rumble from player damage/contact events.
+
+### Skip Track
+
+Source: `modules\skip_track`
+
+Default controls:
+
+```ini
+hotkey_vk=78
+controller_buttons=LEFT_SHOULDER
+```
+
+`78` is the Windows virtual-key code for `N`.
+
+## Build Requirements
+
+- Windows
+- Visual Studio 2022 C++ build tools with x86 toolchain
+- PowerShell
+
+Each module still has its own `build.ps1` for focused development. The top-level `build.ps1` calls all module builds and gathers the installable files into `dist\`.
+
+## Notes
+
+This is not a one-DLL merge yet. Keeping the modules separate is deliberate: the current combination is tested and stable, while a single binary would require careful hook-order and proxy-loader work.

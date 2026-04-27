@@ -16,33 +16,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Plugin
+      - name: Build Mods
         shell: powershell
         run: |
           powershell -ExecutionPolicy Bypass -File .\build.ps1
 
-      - name: Use Pinned winmm.dll
+      - name: Verify Release Files
         shell: powershell
         run: |
-          $winmm = ".\third_party\winmm.dll"
-          if (-not (Test-Path $winmm)) {
-            throw "Pinned winmm.dll is missing from third_party."
+          $required = @(
+            ".\dist\winmm.dll",
+            ".\dist\fo2_skip_track.asi",
+            ".\dist\fo2_skip_track.ini",
+            ".\dist\dinput8.dll",
+            ".\dist\fo2_xinput_rumble.ini",
+            ".\dist\fo2_zpatch_reimpl.asi",
+            ".\dist\fo2_zpatch_reimpl.ini"
+          )
+
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Missing release file: $path"
+            }
           }
 
-          Copy-Item $winmm ".\winmm.dll"
-
-      - name: Prepare Release Files
+      - name: Prepare Release Zip
         shell: powershell
         run: |
           $releaseDir = Join-Path $PWD "release"
           New-Item -ItemType Directory -Force $releaseDir | Out-Null
 
-          Copy-Item .\fo2_skip_track.asi $releaseDir
-          Copy-Item .\fo2_skip_track.ini $releaseDir
-          Copy-Item .\winmm.dll $releaseDir
-          Copy-Item .\README.md $releaseDir
+          Copy-Item .\dist\* $releaseDir -Force
+          Copy-Item .\README.md $releaseDir -Force
+          Copy-Item .\LICENSE $releaseDir -Force
 
-          $zipName = "fo2_skip_track-${{ github.ref_name }}.zip"
+          $zipName = "fo2_mods-${{ github.ref_name }}.zip"
           Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
 
       - name: Create GitHub Release
@@ -50,4 +58,4 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            fo2_skip_track-${{ github.ref_name }}.zip
+            fo2_mods-${{ github.ref_name }}.zip
