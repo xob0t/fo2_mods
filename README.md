@@ -6,7 +6,7 @@ Fully vibecoded, rigorously tested.
 
 ## Mods
 
-- `fo2_zpatch_reimpl`: widescreen/FOV fixes, intro skip, FPS unlock, frame pacing fix, v-sync removal, borderless windowed mode.
+- `fo2_zpatch_reimpl`: widescreen/FOV fixes, license and intro skips, FPS unlock, frame pacing fix, v-sync removal, borderless windowed mode.
 - `fo2_xinput_rumble`: XInput controller rumble with directional feedback and gameplay-event rumble.
 - `fo2_skip_track`: music track skip from keyboard or controller.
 
@@ -35,6 +35,7 @@ Install files:
 Default fixes:
 
 ```ini
+SkipLicenseScreen=1
 SkipIntro=1
 UncapFPS=1
 FramePacingFix=1
@@ -46,6 +47,7 @@ WidescreenFix_FOVScaling=1
 
 Feature notes:
 
+- `SkipLicenseScreen` hides the license/copyright artwork and removes its five-second startup delay.
 - `SkipIntro` bypasses the startup intro videos.
 - `UncapFPS` unlocks rendering while keeping the original game timing interval intact.
 - `FramePacingFix` improves the stock frame gate by removing the old `Sleep(1)` yield that can cause uneven pacing on modern Windows.

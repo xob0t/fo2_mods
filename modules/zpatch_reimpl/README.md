@@ -23,6 +23,7 @@ Copy these files next to `FlatOut2.exe`:
 
 ## New Patches
 
+- `SkipLicenseScreen`: hides the license/copyright artwork and removes its five-second startup delay.
 - `FramePacingFix`: removes the stock frame limiter's `Sleep(1)` yield and requests 1 ms timer resolution. This patch is not from original ZPatchFO2. It is included to reduce uneven pacing on modern Windows while preserving the original timing interval.
 
 ## Omitted Patches
@@ -40,6 +41,7 @@ Copy these files next to `FlatOut2.exe`:
 Log=1
 
 [Fixes]
+SkipLicenseScreen=1
 SkipIntro=1
 UncapFPS=1
 FramePacingFix=1

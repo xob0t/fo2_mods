@@ -13,6 +13,7 @@
 namespace {
 
 bool g_log_enabled = true;
+bool g_skip_license_screen = true;
 bool g_skip_intro = true;
 bool g_uncap_fps = true;
 bool g_frame_pacing_fix = true;
@@ -143,6 +144,7 @@ void LoadConfig()
     BuildGamePath(g_log_path, MAX_PATH, "fo2_zpatch_reimpl.log");
 
     g_log_enabled = GetPrivateProfileIntA("General", "Log", 1, ini_path) != 0;
+    g_skip_license_screen = GetPrivateProfileIntA("Fixes", "SkipLicenseScreen", 1, ini_path) != 0;
     g_skip_intro = GetPrivateProfileIntA("Fixes", "SkipIntro", 1, ini_path) != 0;
     g_uncap_fps = GetPrivateProfileIntA("Fixes", "UncapFPS", 1, ini_path) != 0;
     g_frame_pacing_fix = GetPrivateProfileIntA("Fixes", "FramePacingFix", 1, ini_path) != 0;
@@ -637,6 +639,34 @@ std::uint8_t* FindBytes(const ModuleRange& range, const std::uint8_t* bytes, siz
     return nullptr;
 }
 
+bool PatchSkipLicenseScreen()
+{
+    // Preserve the legal-screen render/initialization path, but make its
+    // texture transparent and reduce the mandatory 5000 ms wait to zero.
+    auto* opacity = reinterpret_cast<std::uint8_t*>(0x005213EA);
+    const std::uint8_t expected_opacity[] = {0x00, 0x00, 0x80, 0x3F}; // 1.0f
+    const std::uint8_t zero_opacity[] = {0x00, 0x00, 0x00, 0x00};
+
+    auto* timeout = reinterpret_cast<std::uint8_t*>(0x00521457);
+    const std::uint8_t expected_timeout[] = {0x88, 0x13, 0x00, 0x00}; // 5000 ms
+    const std::uint8_t zero_timeout[] = {0x00, 0x00, 0x00, 0x00};
+
+    if (std::memcmp(opacity, expected_opacity, sizeof(expected_opacity)) != 0 ||
+        std::memcmp(timeout, expected_timeout, sizeof(expected_timeout)) != 0) {
+        Log("SkipLicenseScreen: instruction pattern mismatch");
+        return false;
+    }
+
+    if (!WriteMemory(opacity, zero_opacity, sizeof(zero_opacity)) ||
+        !WriteMemory(timeout, zero_timeout, sizeof(zero_timeout))) {
+        Log("SkipLicenseScreen: failed to patch legal screen");
+        return false;
+    }
+
+    Log("SkipLicenseScreen: changed legal texture opacity and timeout to zero at 0x%p and 0x%p", opacity, timeout);
+    return true;
+}
+
 bool PatchSkipIntro(const ModuleRange& range)
 {
     // Current Steam exe startup video routine starts with this prologue and
@@ -1005,8 +1035,9 @@ void ApplyPatches()
     const ModuleRange exe = GetExeRange();
     Log("FO2 ZPatch reimplementation attached: exe=0x%p size=0x%lX", exe.base, static_cast<unsigned long>(exe.size));
     Log(
-        "Config: Log=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
+        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
         g_log_enabled ? 1 : 0,
+        g_skip_license_screen ? 1 : 0,
         g_skip_intro ? 1 : 0,
         g_uncap_fps ? 1 : 0,
         g_frame_pacing_fix ? 1 : 0,
@@ -1020,6 +1051,9 @@ void ApplyPatches()
         static_cast<unsigned long>(g_menu_car_max_skin_file_size)
     );
 
+    if (g_skip_license_screen) {
+        PatchSkipLicenseScreen();
+    }
     if (g_skip_intro) {
         PatchSkipIntro(exe);
     }
