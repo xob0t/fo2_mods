@@ -20,19 +20,23 @@ local SplitScreen
 local SPLIT_LAYOUT_HORIZONTAL_EVENT=2130837505 -- 0x7F020001
 local SPLIT_LAYOUT_VERTICAL_EVENT=2130837506   -- 0x7F020002
 
-local function LoadSplitLayout()
-	local chunk=loadfile("fo2_splitscreen_layout.lua")
-	if chunk then
-		local ok,value=pcall(chunk)
-		if ok and type(value) == "number" then
-			if value == 0 then
-				return false
-			elseif value == 1 then
-				return true
-			end
+local function QuerySplitLayout()
+	-- Native returns bit 0 for active Vertical and bit 1 for capability. The
+	-- binding is installed transactionally before this override is mounted.
+	local result=Input.GetSplitscreenLayoutState()
+	if type(result) == "number" and result == math.floor(result) and result >= 0 and result <= 3 then
+		if result == 3 then
+			return true,true
+		elseif result == 2 then
+			return false,true
+		elseif result == 0 then
+			return false,false
 		end
 	end
-	return true
+
+	-- A malformed result must never select geometry that native code has not
+	-- positively reported as available.
+	return false,false
 end
 
 local function ApplySplitLayout(vertical)
@@ -42,17 +46,20 @@ local function ApplySplitLayout(vertical)
 		Event:PostEvent(event(SPLIT_LAYOUT_HORIZONTAL_EVENT))
 	end
 
-	-- The native bridge persists its authoritative active orientation before
-	-- PostEvent returns. Reload it so a signature/capability fallback to
-	-- Horizontal is reflected immediately instead of leaving a stale label.
-	local active_vertical=LoadSplitLayout()
+	-- PostEvent applies and persists synchronously. Query the native bridge so
+	-- a capability fallback or persistence failure is reflected immediately.
+	local active_vertical,vertical_capable=QuerySplitLayout()
 	if state then
 		state.split_vertical=active_vertical
+		state.split_vertical_capable=vertical_capable
 	end
 	return active_vertical
 end
 
-local function SplitLayoutLabel(vertical)
+local function SplitLayoutLabel(vertical,capable)
+	if not capable then
+		return L"HORIZONTAL (VERTICAL UNAVAILABLE)"
+	end
 	if vertical then
 		return L"VERTICAL (LEFT / RIGHT)"
 	end
@@ -447,7 +454,7 @@ local function SetPlayerBars()
 		W("split_layout_label"):SetAlpha(1)
 		local layoutvalue=W("split_layout_value")
 		layoutvalue:SetAlpha(1)
-		layoutvalue:SetTitle(SplitLayoutLabel(state.split_vertical))
+		layoutvalue:SetTitle(SplitLayoutLabel(state.split_vertical,state.split_vertical_capable))
 		W("split_layout_left"):HideWindow()
 		W("split_layout_right"):HideWindow()
 	end
@@ -520,6 +527,9 @@ local function cycle_splitinput(direction)
 		return
 	end
 	if playerindex == 3 then
+		if not state.split_vertical_capable then
+			return false
+		end
 		state.split_vertical=not state.split_vertical
 		ApplySplitLayout(state.split_vertical)
 		splitinput_setselected()
@@ -689,8 +699,7 @@ function menu_partymode.create(self)
 		state.num_players= 0
 		state.players={}
 		if SplitScreen then
-			state.split_vertical=LoadSplitLayout()
-			ApplySplitLayout(state.split_vertical)
+			state.split_vertical,state.split_vertical_capable=QuerySplitLayout()
 		end
 
 		for i=1,8 do

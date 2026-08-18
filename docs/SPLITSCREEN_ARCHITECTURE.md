@@ -84,7 +84,7 @@ validated before the first core write; any failed write rolls the transaction ba
 | Native hooks, version gates, layout, input, post-process | `modules/zpatch_reimpl/fo2_zpatch_reimpl.cpp` | `fo2_zpatch_reimpl.asi` |
 | Feature configuration | `modules/zpatch_reimpl/fo2_zpatch_reimpl.ini` | `fo2_zpatch_reimpl.ini` |
 | Archive build and verification | `modules/zpatch_reimpl/build_splitscreen_bfs.ps1` | generated `fo2_splitscreen.bfs` and 19-byte `fo2_splitscreen_filesystem` |
-| Runtime layout selection | party-menu selector plus private native events | `fo2_splitscreen_layout.lua` containing exactly `return 0` or `return 1` |
+| Runtime layout selection | party-menu selector, private native setter events, and `Input.GetSplitscreenLayoutState()` | ASI-owned `fo2_splitscreen_layout.lua` containing exactly `return 0` or `return 1` |
 
 The BFS is a build output, not source. The filesystem file must contain exactly
 `fo2_splitscreen.bfs` with no BOM or line ending. The runtime refuses to install the
@@ -258,23 +258,15 @@ Editing is transactional from the user's perspective:
 | confirm | validate device count/range/uniqueness, retain changes | re-apply and retain |
 | cancel, menu back, or deinit during editing | restore snapshots | re-apply and persist original selection |
 
-`LoadSplitLayout` uses `loadfile` plus `pcall`, accepts only numeric 0 or 1, and
-defaults to vertical for a missing, invalid, or failing chunk. Labels and widget
-titles remain wide strings through `L(...)`, `ConvertToWString`, and
-`WStringConcat`.
-
-Two low-severity edge cases are known:
-
-- if every input device disappears after the editor has opened, the current early
-  device-count guard also prevents changing the otherwise device-independent layout
-  row; and
-- if the native three-site orientation transaction is unavailable, C++ safely forces
-  and persists horizontal, but a just-posted vertical choice can leave the Lua label
-  stale until the party menu is recreated.
-
-Neither affects the verified pinned executable in the normal two-device flow. A
-future UI refactor should make the native active orientation queryable instead of
-assuming that a posted request was accepted.
+`Input.GetSplitscreenLayoutState()` returns a numeric bit field: bit 0 means Vertical
+is active and bit 1 means the native Vertical transaction is available. The party
+script queries it at initialization and immediately after each setter event, treating
+any invalid result as Horizontal/unavailable. It never calls `loadfile` or `dofile`
+for the game-root state artifact. The ASI owns loading and atomic persistence, so a
+missing file cannot become a BED fatal error and a native fallback is reflected in
+the label synchronously. If capability is unavailable, the third row displays a
+non-changing Horizontal fallback. Labels and widget titles remain wide strings
+through `L(...)`, `ConvertToWString`, and `WStringConcat`.
 
 ## Script state machine and current two-player assumptions
 
@@ -350,6 +342,7 @@ quadrants; that remains a visual acceptance test.
 | `0x0055D705` | `3C FF 74 37 55` | `SplitscreenPressedControllerHook55D705` |
 | `0x0055D785` | `3C FF 74 36 55` | `SplitscreenHeldControllerHook55D785` |
 | `0x004CBB26` | renderer post-process dispatch sequence | `SplitscreenPostProcessingHook4CBB26` |
+| `0x004A738A` | first controller-constant registration after the stock `Input` methods | `SplitscreenInputRegistrationHook4A738A` |
 | `0x0048D2F5` | call to stock numeric-event descriptor lookup | `SplitscreenEventDescriptorHook48D2F5` |
 | `0x0048D4C0` | built-event null check and queue path; first 6 bytes replaced | `SplitscreenPostEventHook48D4C0` |
 | `0x00520F7E` | `push 0x00677DF8`; stock `-binarydb` setup | `SplitscreenFilesystemHook520F7E` |
@@ -373,7 +366,10 @@ stock null-check/queue path for all others. Core installation scans the stock ev
 table first and fails closed if either private ID is already registered. Selection is
 stored by writing an eight-byte temporary file, flushing it, and atomically replacing
 `fo2_splitscreen_layout.lua`. Missing or invalid state defaults to vertical; native
-orientation-hook failure forces and persists horizontal.
+orientation-hook failure forces and persists horizontal. The registration hook adds
+`Input.GetSplitscreenLayoutState()` to the existing `Input` Lua table before the BFS
+override is mounted. Its 0..3 result reports live orientation/capability directly;
+BED code never opens the persisted file.
 
 ## Four-player blockers and risks
 

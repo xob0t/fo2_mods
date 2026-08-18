@@ -679,6 +679,50 @@ DWORD HandleSplitscreenOrientationEvent(const DWORD* event_data)
     return 1;
 }
 
+int __cdecl LuaGetSplitscreenLayoutState(void* lua_state)
+{
+    // Return bit 0 for active Vertical and bit 1 for Vertical capability.
+    const DWORD state = (g_splitscreen_vertical_capable ? 2u : 0u) |
+        (g_splitscreen_vertical_capable && g_splitscreen_vertical_layout ? 1u : 0u);
+    using LuaPushIntegerFn = void (__cdecl*)(void*, int);
+    reinterpret_cast<LuaPushIntegerFn>(0x005B46E0)(lua_state, static_cast<int>(state));
+    return 1;
+}
+
+void __cdecl RegisterSplitscreenLayoutBinding(void* lua_state, int input_table_index)
+{
+    using LuaPushStringFn = void (__cdecl*)(void*, const char*);
+    using LuaPushCClosureFn = void (__cdecl*)(void*, void*, int);
+    using LuaSetTableFn = void (__cdecl*)(void*, int);
+
+    reinterpret_cast<LuaPushStringFn>(0x005B4790)(lua_state, "GetSplitscreenLayoutState");
+    reinterpret_cast<LuaPushCClosureFn>(0x005B48A0)(
+        lua_state,
+        reinterpret_cast<void*>(&LuaGetSplitscreenLayoutState),
+        0
+    );
+    reinterpret_cast<LuaSetTableFn>(0x005B4E20)(lua_state, input_table_index);
+}
+
+__declspec(naked) void SplitscreenInputRegistrationHook4A738A()
+{
+    __asm {
+        pushfd
+        pushad
+        push esi
+        push ebp
+        call RegisterSplitscreenLayoutBinding
+        add esp, 8
+        popad
+        popfd
+
+        // Replay the first stock controller-constant registration push.
+        push 0x00671AEC
+        mov eax, 0x004A738F
+        jmp eax
+    }
+}
+
 __declspec(naked) void SplitscreenEventDescriptorHook48D2F5()
 {
     __asm {
@@ -1991,6 +2035,10 @@ bool PatchSplitscreenFix(const ModuleRange& range)
         0xA1, 0x14, 0x84, 0x8E, 0x00, 0x56, 0x8D, 0x54, 0x24, 0x0C,
         0xE8, 0x2B, 0xAA, 0xFC, 0xFF
     };
+    const std::uint8_t input_registration_expected[] = {
+        0x68, 0xEC, 0x1A, 0x67, 0x00,
+        0x55, 0xE8, 0xFB, 0xD3, 0x10, 0x00
+    };
     const std::uint8_t filesystem_expected[] = {0x68, 0xF8, 0x7D, 0x67, 0x00};
 
     // Install the startup mount last. The replacement script therefore
@@ -2005,6 +2053,7 @@ bool PatchSplitscreenFix(const ModuleRange& range)
         {reinterpret_cast<std::uint8_t*>(0x0055D705), pressed_controller_expected, sizeof(pressed_controller_expected), sizeof(pressed_controller_expected), reinterpret_cast<void*>(&SplitscreenPressedControllerHook55D705), "pressed-controller", false},
         {reinterpret_cast<std::uint8_t*>(0x0055D785), held_controller_expected, sizeof(held_controller_expected), sizeof(held_controller_expected), reinterpret_cast<void*>(&SplitscreenHeldControllerHook55D785), "held-controller", false},
         {reinterpret_cast<std::uint8_t*>(0x004CBB26), post_processing_expected, sizeof(post_processing_expected), sizeof(post_processing_expected), reinterpret_cast<void*>(&SplitscreenPostProcessingHook4CBB26), "post-processing-viewport", false},
+        {reinterpret_cast<std::uint8_t*>(0x004A738A), input_registration_expected, sizeof(input_registration_expected), 5, reinterpret_cast<void*>(&SplitscreenInputRegistrationHook4A738A), "split-layout-query-binding", false},
         {reinterpret_cast<std::uint8_t*>(0x0048D2F5), orientation_descriptor_expected, sizeof(orientation_descriptor_expected), sizeof(orientation_descriptor_expected), reinterpret_cast<void*>(&SplitscreenEventDescriptorHook48D2F5), "orientation-event-descriptor", true},
         {reinterpret_cast<std::uint8_t*>(0x0048D4C0), orientation_post_expected, sizeof(orientation_post_expected), 6, reinterpret_cast<void*>(&SplitscreenPostEventHook48D4C0), "orientation-event-post", false},
         {reinterpret_cast<std::uint8_t*>(0x00520F7E), filesystem_expected, sizeof(filesystem_expected), sizeof(filesystem_expected), reinterpret_cast<void*>(&SplitscreenFilesystemHook520F7E), "filesystem-mount", false},
