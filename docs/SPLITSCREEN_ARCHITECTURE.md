@@ -171,20 +171,35 @@ dedicated chunked path for counts of at least four, updating camera fields `+0x1
 and `+0x118` four at a time before handling any remainder. This is native four-camera
 evidence, not a guarantee that HUD or every game mode is correct at four players.
 
-Two projection/aspect sites recognize a count of 2:
+Two projection/aspect sites recognize a count of 2. The viewport builder sets a
+render latch only after completing a validated vertical two-record rewrite. That
+latch, rather than the transient `GameFlow.Mode` field, selects the vertical aspect
+path during later render passes.
 
 | Site | Role | Current vertical behavior |
 | ---: | --- | --- |
-| `0x004C9E27` | primary split projection/aspect | replaces stock x2 factor with x0.5 and records vertical split mode |
+| `0x004C9E27` | primary split projection/aspect | keeps stock x2 for horizontal; uses x0.5 when the vertical render latch is active |
 | `0x004CBD5D` | secondary split projection/aspect | same policy for the second projection path |
-| `0x004CBDEF` | widescreen projection extents | halves vertical extents for top/bottom; halves horizontal extents for left/right |
-| `0x004C9F63` | widescreen matrix-object extents | recalculates using the active split mode |
-| `0x0059964A` | widescreen projection-stack extents | recalculates using the active split mode |
+| `0x004CBDEF` | widescreen projection extents | derives horizontal extent from the effective aspect at projection `+0x118` |
+| `0x004C9F63` | widescreen matrix-object extents | applies the same authoritative-aspect calculation to the matrix object |
+| `0x0059964A` | widescreen projection-stack extents | applies the same authoritative-aspect calculation to the projection stack |
+| `0x004B9BEB` | singleton race-map render call | centers the map on the full 640-unit HUD canvas only while the vertical render latch is active |
 
-The runtime orientation patch is a separate three-site transaction: primary aspect,
-secondary aspect, and the layout-builder call. It is installed even when horizontal
-is selected so the UI can switch immediately. A missing, changed, or partially
-writable site leaves the core split feature installed but falls back to horizontal.
+The widescreen extent helpers preserve vertical FOV and use the native effective
+viewport aspect exactly once: `V=tan(FOV/2)*near*0.75`, `H=V*aspect` for the matrix
+path, with the near term omitted for the stack path. The count-two native hooks are
+responsible for making `aspect` twice the device aspect for top/bottom or half the
+device aspect for left/right. This avoids the former global-desktop-aspect plus
+second split-mode correction.
+
+The runtime orientation patch is a separate four-site transaction: primary aspect,
+secondary aspect, singleton race-map call, and layout-builder call. It is installed
+even when horizontal is selected so the UI can switch immediately. A missing,
+changed, or partially writable site leaves the core split feature installed but
+falls back to horizontal. The race-map hook changes only X for map type 1; the one
+shared 128-unit map is placed at X=256 on the 640-unit HUD canvas and intentionally
+spans the center divider. Horizontal, single-player, and derby maps retain stock
+placement.
 
 Four-player projection should use the native count-4 path initially. A 2x2 quadrant
 retains the full device aspect ratio, so it does not need the count-2 scalar used by
@@ -353,6 +368,7 @@ quadrants; that remains a visual acceptance test.
 | ---: | --- | --- |
 | `0x004C9E27` | `8B C3 83 E8 02 75 02 DC C0` | `ProjectionSplitModeHook` |
 | `0x004CBD5D` | `8B C6 83 E8 02 75 02 DC C0` | `ProjectionSplitModeSecondaryHook4CBD5D` |
+| `0x004B9BEB` | `E8 F0 BE 00 00`, singleton map-render call | `SplitscreenRaceMapHook4B9BEB` |
 | `0x0045CF1B` | `E8 00 39 01 00`, call to native viewport builder | `SplitscreenViewportLayoutCall45CF1B` |
 
 The vertical transaction additionally validates the surrounding caller bytes at
