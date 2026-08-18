@@ -23,6 +23,7 @@ Copy these files next to `FlatOut2.exe`:
 - `WidescreenFix`: patches widescreen menu/layout scaling for modern aspect ratios.
 - `WidescreenFix_FOVScaling`: patches garage/race camera FOV and projection behavior for widescreen and ultrawide displays.
 - `SplitscreenFix`: mounts the repo-owned split-screen menu archive and enables the dormant native two-player paths only while the game reports `GM_SPLITSCREEN`.
+- `SplitscreenOrientation`: selects `Vertical` left/right viewports or `Horizontal` top/bottom viewports. The built-in fallback is `Horizontal`; the shipped INI selects `Vertical`.
 - `SplitscreenPostProcessingFix`: experimental, separately opt-in full-frame post-processing for split screen. It has no behavioral effect unless `SplitscreenFix` is also enabled.
 - `SplitscreenZoomInputFix`: optional compatibility for Zoom Platform's controller-to-`SendInput` Return synthesis at split-screen ready prompts. It has no effect unless `SplitscreenFix` is enabled.
 
@@ -54,9 +55,11 @@ The ASI mounts the archive through the game's stock filesystem-list parser. The 
 
 The other four input detours use the live game-mode field at `[*0x008E8410 + 0x464]`: value `10` selects split-screen routing, while a null game-flow pointer or any other mode replays the exact stock instructions and branches. This avoids ZPatch's four permanent input-routing bypasses outside split-screen mode. Disabling `SplitscreenFix` leaves both stock startup writes unchanged because none of the hooks are installed.
 
+`SplitscreenOrientation=Vertical` installs a separate three-site, signature-checked transaction. It wraps the stock viewport builder call at `0x0045CF1B`, then rewrites the two records as left/right halves only in `GM_SPLITSCREEN`. Player 1 receives `floor(width/2)` columns and player 2 receives the remainder, so odd display widths lose no pixels. The two independent stock count-two aspect doublers at `0x004C9E27` and `0x004CBD5D` are replaced with shared layout-aware hooks: horizontal keeps the stock `2.0` scale, while vertical uses `0.5`. Widescreen projection extents likewise halve vertical extent for horizontal split and horizontal extent for vertical split. If any complete signature fails, the orientation transaction rolls back and the core split feature continues with the horizontal layout.
+
 The mount, one feature-scoped startup-slot hook, the ready-owner gate, four mode-scoped routing hooks, and the post-processing dispatch hook form one signature-checked eight-site transaction. The implementation validates the pinned executable layout, PE timestamp, all eight complete instruction sequences, and both support files before its first write. It installs the mount last, verifies every branch, and restores every earlier site if installation fails. With `SplitscreenPostProcessingFix=0`, the post-processing dispatch replays the exact single stock call.
 
-`SplitscreenPostProcessingFix=1` is experimental. The stock call at `0x004CBB26` can run with player 2's half-screen viewport selected even though the post-process implementation captures and filters shared full-device targets. The hook temporarily selects `(0,0,renderer_width,renderer_height)`, invokes the stock post process exactly once, restores layout record 1's viewport, and resumes. A repeated post pass is deliberately avoided because it would feed already-processed shared targets into the second pass. This may still expose a split seam or shader-specific edge artifacts and adds a full-frame post-process cost, so it defaults to off and can be toggled independently of input/split functionality.
+`SplitscreenPostProcessingFix=1` is experimental. The stock call at `0x004CBB26` can run with the final player's half-screen viewport selected even though the post-process implementation captures and filters shared full-device targets. The hook validates and snapshots the final layout record, temporarily selects `(0,0,renderer_width,renderer_height)`, invokes the stock post process exactly once, restores that viewport and ordinal, and resumes. A repeated post pass is deliberately avoided because it would feed already-processed shared targets into the second pass. This is orientation-neutral, but may still expose a split seam or shader-specific edge artifacts and adds a full-frame post-process cost, so it defaults to off and can be toggled independently of input/split functionality.
 
 `GM_SPLITSCREEN` is deliberately set only at race launch; the shared party-menu creation path calls `GameFlow.ClearRace()`, so cancel/back cannot leave split routing active.
 
@@ -78,6 +81,7 @@ BorderlessWindowed=0
 WidescreenFix=1
 WidescreenFix_FOVScaling=1
 SplitscreenFix=0
+SplitscreenOrientation=Vertical
 SplitscreenPostProcessingFix=0
 SplitscreenZoomInputFix=1
 ```

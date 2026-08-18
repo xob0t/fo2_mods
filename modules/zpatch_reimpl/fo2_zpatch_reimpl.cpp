@@ -25,6 +25,8 @@ bool g_widescreen_fov_scaling = false;
 bool g_splitscreen_fix = false;
 bool g_splitscreen_post_processing_fix = false;
 bool g_splitscreen_zoom_input_fix = true;
+bool g_splitscreen_vertical_layout = false;
+bool g_splitscreen_vertical_layout_requested = false;
 bool g_menu_car_backface_culling = true;
 DWORD g_menu_car_max_model_file_size = 524288;
 DWORD g_menu_car_max_skin_file_size = 2097152;
@@ -66,6 +68,7 @@ DWORD g_widescreen_menu_scale_bits = 0x40400000; // 3.0f
 const float* g_menu_transform_source = nullptr;
 float* g_menu_transform_stack = nullptr;
 DWORD g_projection_split_mode = 0;
+float g_projection_vertical_aspect_scale = 0.5f;
 DWORD FloatBits(float value)
 {
     DWORD bits = 0;
@@ -108,6 +111,17 @@ struct ModuleRange
     std::uint8_t* base;
     DWORD size;
 };
+
+bool ModuleContains(const ModuleRange& range, const void* address, size_t size)
+{
+    if (range.base == nullptr || address == nullptr || size == 0) {
+        return false;
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(range.base);
+    const auto end = begin + range.size;
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return target >= begin && target <= end && size <= end - target;
+}
 
 void BuildGamePath(char* out, DWORD out_size, const char* name)
 {
@@ -178,9 +192,41 @@ void LoadConfig()
         GetPrivateProfileIntA("Fixes", "SplitscreenPostProcessingFix", 0, ini_path) != 0;
     g_splitscreen_zoom_input_fix =
         GetPrivateProfileIntA("Fixes", "SplitscreenZoomInputFix", 1, ini_path) != 0;
+    char splitscreen_orientation[16] = {};
+    GetPrivateProfileStringA(
+        "Fixes",
+        "SplitscreenOrientation",
+        "Horizontal",
+        splitscreen_orientation,
+        static_cast<DWORD>(sizeof(splitscreen_orientation)),
+        ini_path
+    );
+    g_splitscreen_vertical_layout_requested = _stricmp(splitscreen_orientation, "Vertical") == 0;
+    if (!g_splitscreen_vertical_layout_requested &&
+        _stricmp(splitscreen_orientation, "Horizontal") != 0) {
+        Log(
+            "SplitscreenOrientation: unknown value '%s'; falling back to Horizontal",
+            splitscreen_orientation
+        );
+    }
     g_menu_car_backface_culling = GetPrivateProfileIntA("Fixes", "MenuCarBackfaceCulling", 1, ini_path) != 0;
     g_menu_car_max_model_file_size = std::max<DWORD>(GetPrivateProfileIntA("Fixes", "MenuCarMaxModelFileSize", 524288, ini_path), 1);
     g_menu_car_max_skin_file_size = std::max<DWORD>(GetPrivateProfileIntA("Fixes", "MenuCarMaxSkinFileSize", 2097152, ini_path), 1);
+}
+
+bool IsWritableMemory(const void* address, size_t size)
+{
+    if (!IsReadableMemory(address, size)) {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    const DWORD protect = mbi.Protect & 0xFF;
+    return protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+        protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
 }
 
 bool WriteMemory(void* address, const void* data, size_t size)
@@ -277,13 +323,19 @@ void RecalculateProjectionMatrix(void* projection)
     const float near_scale = *reinterpret_cast<float*>(bytes + 0x10C);
     const float fov_radians = *reinterpret_cast<float*>(bytes + 0x114);
     const double half_tangent = std::tan(static_cast<double>(fov_radians) * 0.5);
-    const float horizontal = static_cast<float>(half_tangent * static_cast<double>(near_scale) * static_cast<double>(g_widescreen_aspect) * 0.75);
-    const float vertical = static_cast<float>(half_tangent * static_cast<double>(near_scale));
+    float horizontal = static_cast<float>(half_tangent * static_cast<double>(near_scale) * static_cast<double>(g_widescreen_aspect) * 0.75);
+    float vertical = static_cast<float>(half_tangent * static_cast<double>(near_scale));
+
+    if (g_projection_split_mode == 1) {
+        vertical *= 0.5f;
+    } else if (g_projection_split_mode == 2) {
+        horizontal *= 0.5f;
+    }
 
     *reinterpret_cast<float*>(bytes + 0x0F4) = horizontal;
     *reinterpret_cast<float*>(bytes + 0x0F0) = -horizontal;
-    *reinterpret_cast<float*>(bytes + 0x0FC) = g_projection_split_mode != 0 ? vertical * 0.5f : vertical;
-    *reinterpret_cast<float*>(bytes + 0x0F8) = g_projection_split_mode != 0 ? -vertical * 0.5f : -vertical;
+    *reinterpret_cast<float*>(bytes + 0x0FC) = vertical;
+    *reinterpret_cast<float*>(bytes + 0x0F8) = -vertical;
 }
 
 __declspec(naked) void ProjectionMatrixExtentsHook()
@@ -329,8 +381,25 @@ __declspec(naked) void ProjectionSplitModeHook()
         mov eax, ebx
         sub eax, 2
         jne not_split
-        fadd st(0), st(0)
         mov dword ptr [g_projection_split_mode], 1
+        cmp byte ptr [g_splitscreen_fix], 0
+        je horizontal_split
+        cmp byte ptr [g_splitscreen_vertical_layout], 0
+        je horizontal_split
+        push edx
+        mov edx, dword ptr [0x008E8410]
+        test edx, edx
+        je horizontal_split_pop
+        cmp dword ptr [edx + 0x464], 10
+        jne horizontal_split_pop
+        pop edx
+        fmul dword ptr [g_projection_vertical_aspect_scale]
+        mov dword ptr [g_projection_split_mode], 2
+        jmp not_split
+    horizontal_split_pop:
+        pop edx
+    horizontal_split:
+        fadd st(0), st(0)
     not_split:
         mov eax, 0x004C9E30
         jmp eax
@@ -347,13 +416,19 @@ void RecalculateProjectionStack(void* projection, void* stack)
     auto* stack_bytes = static_cast<std::uint8_t*>(stack);
     const float fov_radians = *reinterpret_cast<float*>(projection_bytes + 0x114);
     const double half_tangent = std::tan(static_cast<double>(fov_radians) * 0.5);
-    const float horizontal = static_cast<float>(half_tangent * static_cast<double>(g_widescreen_aspect) * 0.75);
-    const float vertical = static_cast<float>(half_tangent);
+    float horizontal = static_cast<float>(half_tangent * static_cast<double>(g_widescreen_aspect) * 0.75);
+    float vertical = static_cast<float>(half_tangent);
+
+    if (g_projection_split_mode == 1) {
+        vertical *= 0.5f;
+    } else if (g_projection_split_mode == 2) {
+        horizontal *= 0.5f;
+    }
 
     *reinterpret_cast<float*>(stack_bytes + 0x18) = horizontal;
     *reinterpret_cast<float*>(stack_bytes + 0x14) = -horizontal;
-    *reinterpret_cast<float*>(stack_bytes + 0x20) = g_projection_split_mode != 0 ? vertical * 0.5f : vertical;
-    *reinterpret_cast<float*>(stack_bytes + 0x1C) = g_projection_split_mode != 0 ? -vertical * 0.5f : -vertical;
+    *reinterpret_cast<float*>(stack_bytes + 0x20) = vertical;
+    *reinterpret_cast<float*>(stack_bytes + 0x1C) = -vertical;
 }
 
 __declspec(naked) void ProjectionStackHook59964A()
@@ -488,6 +563,113 @@ bool IsSplitscreenMode()
 {
     auto* game_flow = *reinterpret_cast<std::uint8_t**>(0x008E8410);
     return game_flow != nullptr && *reinterpret_cast<DWORD*>(game_flow + 0x464) == 10;
+}
+
+void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
+{
+    if (!g_splitscreen_vertical_layout || viewport_count != 2 || !IsSplitscreenMode()) {
+        return;
+    }
+
+    if (!IsWritableMemory(layout_object, 0x64)) {
+        g_splitscreen_vertical_layout = false;
+        Log("SplitscreenOrientation: invalid viewport layout object; reverting to Horizontal");
+        return;
+    }
+
+    auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
+    if (!IsReadableMemory(renderer, 0x10)) {
+        g_splitscreen_vertical_layout = false;
+        Log("SplitscreenOrientation: renderer dimensions unavailable; reverting to Horizontal");
+        return;
+    }
+
+    const DWORD device_width = *reinterpret_cast<DWORD*>(renderer + 0x08);
+    const DWORD device_height = *reinterpret_cast<DWORD*>(renderer + 0x0C);
+    if (device_width < 2 || device_height == 0) {
+        g_splitscreen_vertical_layout = false;
+        Log("SplitscreenOrientation: invalid device dimensions %lux%lu; reverting to Horizontal",
+            static_cast<unsigned long>(device_width),
+            static_cast<unsigned long>(device_height));
+        return;
+    }
+
+    auto* layout = static_cast<std::uint8_t*>(layout_object);
+    const DWORD left_width = device_width / 2;
+    const DWORD right_width = device_width - left_width;
+    auto* left = layout + 0x34;
+    auto* right = left + 0x18;
+
+    *reinterpret_cast<DWORD*>(layout + 0x30) = 2;
+    *reinterpret_cast<DWORD*>(left + 0x00) = 0;
+    *reinterpret_cast<DWORD*>(left + 0x04) = 0;
+    *reinterpret_cast<DWORD*>(left + 0x08) = left_width;
+    *reinterpret_cast<DWORD*>(left + 0x0C) = device_height;
+    *reinterpret_cast<DWORD*>(left + 0x10) = 0;
+    *reinterpret_cast<DWORD*>(left + 0x14) = 0;
+    *reinterpret_cast<DWORD*>(right + 0x00) = left_width;
+    *reinterpret_cast<DWORD*>(right + 0x04) = 0;
+    *reinterpret_cast<DWORD*>(right + 0x08) = right_width;
+    *reinterpret_cast<DWORD*>(right + 0x0C) = device_height;
+    *reinterpret_cast<DWORD*>(right + 0x10) = 0;
+    *reinterpret_cast<DWORD*>(right + 0x14) = 1;
+}
+
+__declspec(naked) void SplitscreenViewportLayoutCall45CF1B()
+{
+    __asm {
+        // Replay the stock builder first so all non-viewport metadata retains
+        // its normal initialization, then rewrite only the two records when
+        // the requested vertical layout is live.
+        push eax
+        push ecx
+        mov edx, 0x00470820
+        call edx
+        pop ecx
+        pop eax
+
+        pushfd
+        pushad
+        push eax
+        push ecx
+        call RewriteVerticalSplitscreenLayout
+        add esp, 8
+        popad
+        popfd
+        ret
+    }
+}
+
+__declspec(naked) void ProjectionSplitModeSecondaryHook4CBD5D()
+{
+    __asm {
+        mov dword ptr [g_projection_split_mode], 0
+        mov eax, esi
+        sub eax, 2
+        jne not_split
+        mov dword ptr [g_projection_split_mode], 1
+        cmp byte ptr [g_splitscreen_fix], 0
+        je horizontal_split
+        cmp byte ptr [g_splitscreen_vertical_layout], 0
+        je horizontal_split
+        push edx
+        mov edx, dword ptr [0x008E8410]
+        test edx, edx
+        je horizontal_split_pop
+        cmp dword ptr [edx + 0x464], 10
+        jne horizontal_split_pop
+        pop edx
+        fmul dword ptr [g_projection_vertical_aspect_scale]
+        mov dword ptr [g_projection_split_mode], 2
+        jmp not_split
+    horizontal_split_pop:
+        pop edx
+    horizontal_split:
+        fadd st(0), st(0)
+    not_split:
+        mov eax, 0x004CBD66
+        jmp eax
+    }
 }
 
 bool IsSplitscreenReadyInputState()
@@ -761,16 +943,20 @@ using RendererPostProcessFn = void(__thiscall*)(void*);
 
 void RunSplitscreenPostProcessing(void* renderer, void** renderer_vtable, DWORD viewport_count)
 {
+    if (!IsReadableMemory(renderer, 0x10) || !IsReadableMemory(renderer_vtable, 0x154)) {
+        return;
+    }
+
     const auto post_process = reinterpret_cast<RendererPostProcessFn>(renderer_vtable[0x150 / sizeof(void*)]);
-    if (!g_splitscreen_post_processing_fix || !IsSplitscreenMode() || viewport_count < 2) {
+    if (!g_splitscreen_post_processing_fix || !IsSplitscreenMode() ||
+        viewport_count < 2 || viewport_count > 4) {
         post_process(renderer);
         return;
     }
 
     auto* layout = *reinterpret_cast<std::uint8_t**>(0x00696DC8);
-    if (!IsReadableMemory(renderer, 0x10) ||
-        !IsReadableMemory(renderer_vtable, 0x154) ||
-        !IsReadableMemory(layout, 0x5C)) {
+    const size_t layout_size = 0x34 + static_cast<size_t>(viewport_count) * 0x18;
+    if (!IsReadableMemory(layout, layout_size)) {
         post_process(renderer);
         return;
     }
@@ -779,23 +965,26 @@ void RunSplitscreenPostProcessing(void* renderer, void** renderer_vtable, DWORD 
         reinterpret_cast<RendererSetViewportFn>(renderer_vtable[0x30 / sizeof(void*)]);
     const DWORD device_width = *reinterpret_cast<DWORD*>(static_cast<std::uint8_t*>(renderer) + 0x08);
     const DWORD device_height = *reinterpret_cast<DWORD*>(static_cast<std::uint8_t*>(renderer) + 0x0C);
+    auto* last_viewport = layout + 0x34 + static_cast<size_t>(viewport_count - 1) * 0x18;
+    const DWORD last_x = *reinterpret_cast<DWORD*>(last_viewport + 0x00);
+    const DWORD last_y = *reinterpret_cast<DWORD*>(last_viewport + 0x04);
+    const DWORD last_width = *reinterpret_cast<DWORD*>(last_viewport + 0x08);
+    const DWORD last_height = *reinterpret_cast<DWORD*>(last_viewport + 0x0C);
+    const DWORD last_ordinal = viewport_count - 1;
+    if (device_width == 0 || device_height == 0 || last_width == 0 || last_height == 0 ||
+        last_x > device_width || last_y > device_height ||
+        last_width > device_width - last_x || last_height > device_height - last_y) {
+        post_process(renderer);
+        return;
+    }
 
     // The stock site runs one full-device post-process call while the last
-    // player's half-screen viewport is still selected. Temporarily select
-    // the composed device surface, process it once, then restore player 2's
-    // viewport so the following stock render loop sees the expected state.
+    // player's viewport is still selected. Snapshot the last layout record,
+    // temporarily select the composed device surface, process it once, then
+    // restore that record for either horizontal or vertical geometry.
     set_viewport(renderer, 0, 0, device_width, device_height, 0);
     post_process(renderer);
-
-    auto* player_two = layout + 0x18;
-    set_viewport(
-        renderer,
-        *reinterpret_cast<DWORD*>(player_two + 0x34),
-        *reinterpret_cast<DWORD*>(player_two + 0x38),
-        *reinterpret_cast<DWORD*>(player_two + 0x3C),
-        *reinterpret_cast<DWORD*>(player_two + 0x40),
-        1
-    );
+    set_viewport(renderer, last_x, last_y, last_width, last_height, last_ordinal);
 }
 
 __declspec(naked) void SplitscreenPostProcessingHook4CBB26()
@@ -1476,6 +1665,90 @@ bool SplitscreenBranchMatches(const SplitscreenPatchSite& site)
     return std::memcmp(site.address, expected_branch, site.patch_size) == 0;
 }
 
+bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
+{
+    g_splitscreen_vertical_layout = false;
+    if (!g_splitscreen_vertical_layout_requested) {
+        Log("SplitscreenOrientation: Horizontal");
+        return true;
+    }
+
+    const std::uint8_t layout_context_expected[] = {
+        0x8B, 0x44, 0x24, 0x14,
+        0x8B, 0x8D, 0xB8, 0x09, 0x00, 0x00,
+        0xE8, 0x00, 0x39, 0x01, 0x00,
+        0x8B, 0x0D, 0x14, 0x84, 0x8E, 0x00
+    };
+    if (!ModuleContains(range, reinterpret_cast<void*>(0x0045CF11), sizeof(layout_context_expected)) ||
+        std::memcmp(reinterpret_cast<void*>(0x0045CF11), layout_context_expected, sizeof(layout_context_expected)) != 0) {
+        Log("SplitscreenOrientation: viewport-builder caller mismatch; falling back to Horizontal");
+        return false;
+    }
+
+    const std::uint8_t layout_call_expected[] = {0xE8, 0x00, 0x39, 0x01, 0x00};
+    const std::uint8_t primary_aspect_expected[] = {
+        0x8B, 0xC3, 0x83, 0xE8, 0x02, 0x75, 0x02, 0xDC, 0xC0
+    };
+    const std::uint8_t secondary_aspect_expected[] = {
+        0x8B, 0xC6, 0x83, 0xE8, 0x02, 0x75, 0x02, 0xDC, 0xC0
+    };
+    const SplitscreenPatchSite sites[] = {
+        {reinterpret_cast<std::uint8_t*>(0x004C9E27), primary_aspect_expected, sizeof(primary_aspect_expected), sizeof(primary_aspect_expected), reinterpret_cast<void*>(&ProjectionSplitModeHook), "primary-projection-aspect", false},
+        {reinterpret_cast<std::uint8_t*>(0x004CBD5D), secondary_aspect_expected, sizeof(secondary_aspect_expected), sizeof(secondary_aspect_expected), reinterpret_cast<void*>(&ProjectionSplitModeSecondaryHook4CBD5D), "secondary-projection-aspect", false},
+        {reinterpret_cast<std::uint8_t*>(0x0045CF1B), layout_call_expected, sizeof(layout_call_expected), sizeof(layout_call_expected), reinterpret_cast<void*>(&SplitscreenViewportLayoutCall45CF1B), "viewport-layout-builder", true},
+    };
+
+    for (const SplitscreenPatchSite& site : sites) {
+        if (!ModuleContains(range, site.address, site.expected_size) ||
+            std::memcmp(site.address, site.expected, site.expected_size) != 0) {
+            char actual[64] = {};
+            if (ModuleContains(range, site.address, site.expected_size)) {
+                FormatBytes(site.address, site.expected_size, actual, sizeof(actual));
+            } else {
+                std::snprintf(actual, sizeof(actual), "outside executable");
+            }
+            Log(
+                "SplitscreenOrientation: signature mismatch for %s at 0x%p actual=%s; falling back to Horizontal",
+                site.label,
+                site.address,
+                actual
+            );
+            return false;
+        }
+    }
+
+    size_t installed = 0;
+    for (; installed < sizeof(sites) / sizeof(sites[0]); ++installed) {
+        const SplitscreenPatchSite& site = sites[installed];
+        const bool wrote = site.call
+            ? WriteCall(site.address, site.hook, site.patch_size)
+            : WriteJump(site.address, site.hook, site.patch_size);
+        if (!wrote || !SplitscreenBranchMatches(site)) {
+            Log(
+                "SplitscreenOrientation: failed to install/verify %s; rolling back to Horizontal",
+                site.label
+            );
+            if (std::memcmp(site.address, site.expected, site.patch_size) != 0) {
+                WriteMemory(site.address, site.expected, site.patch_size);
+            }
+            break;
+        }
+    }
+
+    if (installed != sizeof(sites) / sizeof(sites[0])) {
+        while (installed > 0) {
+            --installed;
+            const SplitscreenPatchSite& site = sites[installed];
+            WriteMemory(site.address, site.expected, site.patch_size);
+        }
+        return false;
+    }
+
+    g_splitscreen_vertical_layout = true;
+    Log("SplitscreenOrientation: Vertical (left/right, odd-width remainder assigned to player 2)");
+    return true;
+}
+
 bool PatchSplitscreenFix(const ModuleRange& range)
 {
     constexpr DWORD kSupportedTimestamp = 0x451D02BD;
@@ -1913,10 +2186,23 @@ bool PatchWidescreenFovMatrixHooks()
         if (std::memcmp(hook_address, expected, sizeof(expected)) == 0) {
             ok = WriteJump(hook_address, reinterpret_cast<void*>(&ProjectionSplitModeHook), sizeof(expected)) && ok;
         } else {
-            char actual[48] = {};
-            FormatBytes(hook_address, sizeof(expected), actual, sizeof(actual));
-            Log("WidescreenFix_FOVScaling: split-mode hook mismatch at 0x004C9E27 actual=%s", actual);
-            ok = false;
+            const SplitscreenPatchSite shared_site = {
+                hook_address,
+                expected,
+                sizeof(expected),
+                sizeof(expected),
+                reinterpret_cast<void*>(&ProjectionSplitModeHook),
+                "primary-projection-aspect",
+                false
+            };
+            if (g_splitscreen_vertical_layout && SplitscreenBranchMatches(shared_site)) {
+                Log("WidescreenFix_FOVScaling: retained shared vertical split-mode hook at 0x004C9E27");
+            } else {
+                char actual[48] = {};
+                FormatBytes(hook_address, sizeof(expected), actual, sizeof(actual));
+                Log("WidescreenFix_FOVScaling: split-mode hook mismatch at 0x004C9E27 actual=%s", actual);
+                ok = false;
+            }
         }
     }
 
@@ -1968,7 +2254,7 @@ void ApplyPatches()
     const ModuleRange exe = GetExeRange();
     Log("FO2 ZPatch reimplementation attached: exe=0x%p size=0x%lX", exe.base, static_cast<unsigned long>(exe.size));
     Log(
-        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d SplitscreenPostProcessingFix=%d SplitscreenZoomInputFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
+        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d SplitscreenOrientation=%s SplitscreenPostProcessingFix=%d SplitscreenZoomInputFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
         g_log_enabled ? 1 : 0,
         g_skip_license_screen ? 1 : 0,
         g_skip_intro ? 1 : 0,
@@ -1979,6 +2265,7 @@ void ApplyPatches()
         g_widescreen_fix ? 1 : 0,
         g_widescreen_fov_scaling ? 1 : 0,
         g_splitscreen_fix ? 1 : 0,
+        g_splitscreen_vertical_layout_requested ? "Vertical" : "Horizontal",
         g_splitscreen_post_processing_fix ? 1 : 0,
         g_splitscreen_zoom_input_fix ? 1 : 0,
         g_menu_car_backface_culling ? 1 : 0,
@@ -1988,6 +2275,9 @@ void ApplyPatches()
 
     if (g_splitscreen_fix) {
         const bool splitscreen_installed = PatchSplitscreenFix(exe);
+        if (splitscreen_installed) {
+            PatchVerticalSplitscreenLayout(exe);
+        }
         if (splitscreen_installed && g_splitscreen_zoom_input_fix) {
             PatchSplitscreenZoomInputFix();
         }
