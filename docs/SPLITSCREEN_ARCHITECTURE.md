@@ -192,14 +192,17 @@ responsible for making `aspect` twice the device aspect for top/bottom or half t
 device aspect for left/right. This avoids the former global-desktop-aspect plus
 second split-mode correction.
 
-The runtime orientation patch is a separate four-site transaction: primary aspect,
-secondary aspect, singleton race-map call, and layout-builder call. It is installed
+The runtime orientation patch is a separate seven-site transaction: primary aspect,
+secondary aspect, three player-2 POSITION anchors, singleton race-map call, and
+layout-builder call. It is installed
 even when horizontal is selected so the UI can switch immediately. A missing,
 changed, or partially writable site leaves the core split feature installed but
 falls back to horizontal. The race-map hook changes only X for map type 1; the one
 shared 128-unit map is placed at X=256 on the 640-unit HUD canvas and intentionally
 spans the center divider. Horizontal, single-player, and derby maps retain stock
 placement.
+In vertical mode the POSITION background, title, and value all take their normal
+per-viewport top anchor; only horizontal player 2 retains the stock bottom override.
 
 Four-player projection should use the native count-4 path initially. A 2x2 quadrant
 retains the full device aspect ratio, so it does not need the count-2 scalar used by
@@ -358,8 +361,6 @@ quadrants; that remains a visual acceptance test.
 | `0x0055D785` | `3C FF 74 36 55` | `SplitscreenHeldControllerHook55D785` |
 | `0x004CBB26` | renderer post-process dispatch sequence | `SplitscreenPostProcessingHook4CBB26` |
 | `0x004A738A` | first controller-constant registration after the stock `Input` methods | `SplitscreenInputRegistrationHook4A738A` |
-| `0x0048D2F5` | call to stock numeric-event descriptor lookup | `SplitscreenEventDescriptorHook48D2F5` |
-| `0x0048D4C0` | built-event null check and queue path; first 6 bytes replaced | `SplitscreenPostEventHook48D4C0` |
 | `0x00520F7E` | `push 0x00677DF8`; stock `-binarydb` setup | `SplitscreenFilesystemHook520F7E` |
 
 ### Vertical two-player transaction
@@ -368,6 +369,9 @@ quadrants; that remains a visual acceptance test.
 | ---: | --- | --- |
 | `0x004C9E27` | `8B C3 83 E8 02 75 02 DC C0` | `ProjectionSplitModeHook` |
 | `0x004CBD5D` | `8B C6 83 E8 02 75 02 DC C0` | `ProjectionSplitModeSecondaryHook4CBD5D` |
+| `0x004B8D49` | split player-2 background bottom-anchor branch | `SplitscreenHudBackgroundHook4B8D49` |
+| `0x004B9F43` | split player-2 POSITION-title bottom-anchor branch | `SplitscreenPositionTitleHook4B9F43` |
+| `0x004BA08F` | split player-2 POSITION-value bottom-anchor branch | `SplitscreenPositionValueHook4BA08F` |
 | `0x004B9BEB` | `E8 F0 BE 00 00`, singleton map-render call | `SplitscreenRaceMapHook4B9BEB` |
 | `0x0045CF1B` | `E8 00 39 01 00`, call to native viewport builder | `SplitscreenViewportLayoutCall45CF1B` |
 
@@ -375,17 +379,19 @@ The vertical transaction additionally validates the surrounding caller bytes at
 `0x0045CF11..0x0045CF25`. Both transactions verify the installed branch target and
 NOP padding, not just whether the write API returned success.
 
-The UI/native bridge reserves event IDs `0x7F020001` (horizontal) and `0x7F020002`
-(vertical). The descriptor hook delegates every other ID to the stock lookup. The
-post-event hook consumes only those two fully built private events and replays the
-stock null-check/queue path for all others. Core installation scans the stock event
-table first and fails closed if either private ID is already registered. Selection is
-stored by writing an eight-byte temporary file, flushing it, and atomically replacing
+The UI/native bridge adds one getter and two no-argument orientation setters to the
+stock `Input` table at the existing registration hook. The setters persist first,
+update live state only on success, and return the authoritative 0..3 state bit field.
+This replaces the earlier numeric-event bridge: Lua's native single-precision number
+conversion rounded both high private IDs to the same `0x7F020000` value before event
+descriptor lookup, so neither setter event could match. Selection is stored by
+writing an eight-byte temporary file, flushing it, and atomically replacing
 `fo2_splitscreen_layout.lua`. Missing or invalid state defaults to vertical; native
 orientation-hook failure forces and persists horizontal. The registration hook adds
-`Input.GetSplitscreenLayoutState()` to the existing `Input` Lua table before the BFS
-override is mounted. Its 0..3 result reports live orientation/capability directly;
-BED code never opens the persisted file.
+`Input.GetSplitscreenLayoutState()`, `Input.SetSplitscreenLayoutHorizontal()`, and
+`Input.SetSplitscreenLayoutVertical()` to the existing `Input` Lua table before the
+BFS override is mounted. Their 0..3 result reports live orientation/capability
+directly; BED code never opens the persisted file.
 
 ## Four-player blockers and risks
 

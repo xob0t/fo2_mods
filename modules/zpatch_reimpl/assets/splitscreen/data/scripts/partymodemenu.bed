@@ -17,13 +17,7 @@ local tracks
 
 local SplitScreen
 
-local SPLIT_LAYOUT_HORIZONTAL_EVENT=2130837505 -- 0x7F020001
-local SPLIT_LAYOUT_VERTICAL_EVENT=2130837506   -- 0x7F020002
-
-local function QuerySplitLayout()
-	-- Native returns bit 0 for active Vertical and bit 1 for capability. The
-	-- binding is installed transactionally before this override is mounted.
-	local result=Input.GetSplitscreenLayoutState()
+local function DecodeSplitLayout(result)
 	if type(result) == "number" and result == math.floor(result) and result >= 0 and result <= 3 then
 		if result == 3 then
 			return true,true
@@ -39,16 +33,26 @@ local function QuerySplitLayout()
 	return false,false
 end
 
+local function QuerySplitLayout()
+	-- Native returns bit 0 for active Vertical and bit 1 for capability. The
+	-- binding is installed transactionally before this override is mounted.
+	return DecodeSplitLayout(Input.GetSplitscreenLayoutState())
+end
+
 local function ApplySplitLayout(vertical)
+	local result
 	if vertical then
-		Event:PostEvent(event(SPLIT_LAYOUT_VERTICAL_EVENT))
+		result=Input.SetSplitscreenLayoutVertical()
 	else
-		Event:PostEvent(event(SPLIT_LAYOUT_HORIZONTAL_EVENT))
+		result=Input.SetSplitscreenLayoutHorizontal()
 	end
 
-	-- PostEvent applies and persists synchronously. Query the native bridge so
-	-- a capability fallback or persistence failure is reflected immediately.
-	local active_vertical,vertical_capable=QuerySplitLayout()
+	-- The native setter applies and persists synchronously, then returns the
+	-- authoritative state. Fall back to the getter only for a malformed result.
+	local active_vertical,vertical_capable=DecodeSplitLayout(result)
+	if type(result) ~= "number" or result ~= math.floor(result) or result < 0 or result > 3 then
+		active_vertical,vertical_capable=QuerySplitLayout()
+	end
 	if state then
 		state.split_vertical=active_vertical
 		state.split_vertical_capable=vertical_capable

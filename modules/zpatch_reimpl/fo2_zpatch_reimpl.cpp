@@ -71,26 +71,6 @@ const float* g_menu_transform_source = nullptr;
 float* g_menu_transform_stack = nullptr;
 DWORD g_projection_split_mode = 0;
 float g_projection_vertical_aspect_scale = 0.5f;
-constexpr DWORD kSplitscreenHorizontalEventId = 0x7F020001;
-constexpr DWORD kSplitscreenVerticalEventId = 0x7F020002;
-
-struct SplitscreenOrientationEventDescriptor
-{
-    const char* name;
-    DWORD id;
-    DWORD flags;
-};
-
-const SplitscreenOrientationEventDescriptor g_splitscreen_horizontal_event = {
-    "FO2_SPLITSCREEN_HORIZONTAL",
-    kSplitscreenHorizontalEventId,
-    0
-};
-const SplitscreenOrientationEventDescriptor g_splitscreen_vertical_event = {
-    "FO2_SPLITSCREEN_VERTICAL",
-    kSplitscreenVerticalEventId,
-    0
-};
 DWORD FloatBits(float value)
 {
     DWORD bits = 0;
@@ -645,15 +625,24 @@ bool IsSplitscreenMode()
     return game_flow != nullptr && *reinterpret_cast<DWORD*>(game_flow + 0x464) == 10;
 }
 
-DWORD HandleSplitscreenOrientationEvent(const DWORD* event_data)
+DWORD GetSplitscreenLayoutStateBits()
 {
-    if (event_data == nullptr ||
-        (event_data[0] != kSplitscreenHorizontalEventId &&
-         event_data[0] != kSplitscreenVerticalEventId)) {
-        return 0;
-    }
+    return (g_splitscreen_vertical_capable ? 2u : 0u) |
+        (g_splitscreen_vertical_capable && g_splitscreen_vertical_layout ? 1u : 0u);
+}
 
-    const bool requested_vertical = event_data[0] == kSplitscreenVerticalEventId;
+int PushSplitscreenLayoutState(void* lua_state)
+{
+    using LuaPushIntegerFn = void (__cdecl*)(void*, int);
+    reinterpret_cast<LuaPushIntegerFn>(0x005B46E0)(
+        lua_state,
+        static_cast<int>(GetSplitscreenLayoutStateBits())
+    );
+    return 1;
+}
+
+int SetSplitscreenLayoutFromLua(void* lua_state, bool requested_vertical)
+{
     const bool requested_active = requested_vertical && g_splitscreen_vertical_capable;
     const bool saved = SaveSplitscreenLayoutState(requested_active);
     if (saved) {
@@ -668,17 +657,22 @@ DWORD HandleSplitscreenOrientationEvent(const DWORD* event_data)
         g_splitscreen_vertical_layout ? "Vertical" : "Horizontal",
         saved ? "saved" : "failed"
     );
-    return 1;
+    return PushSplitscreenLayoutState(lua_state);
 }
 
 int __cdecl LuaGetSplitscreenLayoutState(void* lua_state)
 {
-    // Return bit 0 for active Vertical and bit 1 for Vertical capability.
-    const DWORD state = (g_splitscreen_vertical_capable ? 2u : 0u) |
-        (g_splitscreen_vertical_capable && g_splitscreen_vertical_layout ? 1u : 0u);
-    using LuaPushIntegerFn = void (__cdecl*)(void*, int);
-    reinterpret_cast<LuaPushIntegerFn>(0x005B46E0)(lua_state, static_cast<int>(state));
-    return 1;
+    return PushSplitscreenLayoutState(lua_state);
+}
+
+int __cdecl LuaSetSplitscreenLayoutHorizontal(void* lua_state)
+{
+    return SetSplitscreenLayoutFromLua(lua_state, false);
+}
+
+int __cdecl LuaSetSplitscreenLayoutVertical(void* lua_state)
+{
+    return SetSplitscreenLayoutFromLua(lua_state, true);
 }
 
 void __cdecl RegisterSplitscreenLayoutBinding(void* lua_state, int input_table_index)
@@ -687,13 +681,21 @@ void __cdecl RegisterSplitscreenLayoutBinding(void* lua_state, int input_table_i
     using LuaPushCClosureFn = void (__cdecl*)(void*, void*, int);
     using LuaSetTableFn = void (__cdecl*)(void*, int);
 
-    reinterpret_cast<LuaPushStringFn>(0x005B4790)(lua_state, "GetSplitscreenLayoutState");
-    reinterpret_cast<LuaPushCClosureFn>(0x005B48A0)(
-        lua_state,
-        reinterpret_cast<void*>(&LuaGetSplitscreenLayoutState),
-        0
-    );
-    reinterpret_cast<LuaSetTableFn>(0x005B4E20)(lua_state, input_table_index);
+    struct Binding {
+        const char* name;
+        void* function;
+    };
+    const Binding bindings[] = {
+        {"GetSplitscreenLayoutState", reinterpret_cast<void*>(&LuaGetSplitscreenLayoutState)},
+        {"SetSplitscreenLayoutHorizontal", reinterpret_cast<void*>(&LuaSetSplitscreenLayoutHorizontal)},
+        {"SetSplitscreenLayoutVertical", reinterpret_cast<void*>(&LuaSetSplitscreenLayoutVertical)},
+    };
+
+    for (const Binding& binding : bindings) {
+        reinterpret_cast<LuaPushStringFn>(0x005B4790)(lua_state, binding.name);
+        reinterpret_cast<LuaPushCClosureFn>(0x005B48A0)(lua_state, binding.function, 0);
+        reinterpret_cast<LuaSetTableFn>(0x005B4E20)(lua_state, input_table_index);
+    }
 }
 
 __declspec(naked) void SplitscreenInputRegistrationHook4A738A()
@@ -715,89 +717,43 @@ __declspec(naked) void SplitscreenInputRegistrationHook4A738A()
     }
 }
 
-__declspec(naked) void SplitscreenEventDescriptorHook48D2F5()
-{
-    __asm {
-        cmp esi, 0x7F020001
-        je horizontal
-        cmp esi, 0x7F020002
-        je vertical
-        mov eax, 0x0048C750
-        jmp eax
-    horizontal:
-        lea eax, g_splitscreen_horizontal_event
-        ret
-    vertical:
-        lea eax, g_splitscreen_vertical_event
-        ret
-    }
-}
-
-__declspec(naked) void SplitscreenPostEventHook48D4C0()
-{
-    __asm {
-        lea eax, [esp + 0x08]
-        pushfd
-        pushad
-        push eax
-        call HandleSplitscreenOrientationEvent
-        add esp, 4
-        // MSVC is permitted to materialize a bool return in AL only. Normalize
-        // the full register before preserving it so stale event-pointer bits
-        // cannot make ordinary stock events look like handled private events.
-        movzx eax, al
-        mov dword ptr [esp + 0x1C], eax
-        popad
-        popfd
-        test eax, eax
-        jne swallowed
-
-        // Replay the six bytes overwritten at 0x0048D4C0. A normal event
-        // continues through the stock queue call; a null event keeps the
-        // original short path to the wrapper epilogue.
-        cmp dword ptr [esp + 0x08], esi
-        je stock_done
-        mov eax, 0x0048D4C6
-        jmp eax
-    swallowed:
-    stock_done:
-        mov eax, 0x0048D4D5
-        jmp eax
-    }
-}
-
 void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
 {
-    // Every layout build invalidates the prior render latch. Only a fully
-    // validated two-record vertical rewrite below can reactivate it.
     g_splitscreen_vertical_render_active = false;
-    if (!g_splitscreen_vertical_layout || viewport_count != 2 || !IsSplitscreenMode()) {
+    if (!g_splitscreen_vertical_capable || !g_splitscreen_vertical_layout || viewport_count != 2) {
         return;
     }
 
-    if (!IsWritableMemory(layout_object, 0x64)) {
-        g_splitscreen_vertical_layout = false;
-        SaveSplitscreenLayoutState(false);
-        Log("SplitscreenOrientation: invalid viewport layout object; reverting to Horizontal");
+    const bool split_setup_mode = IsSplitscreenMode();
+    if (!IsReadableMemory(layout_object, 0x64)) {
+        if (split_setup_mode) {
+            g_splitscreen_vertical_layout = false;
+            SaveSplitscreenLayoutState(false);
+            Log("SplitscreenOrientation: invalid viewport layout object; reverting to Horizontal");
+        }
         return;
     }
 
     auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
     if (!IsReadableMemory(renderer, 0x10)) {
-        g_splitscreen_vertical_layout = false;
-        SaveSplitscreenLayoutState(false);
-        Log("SplitscreenOrientation: renderer dimensions unavailable; reverting to Horizontal");
+        if (split_setup_mode) {
+            g_splitscreen_vertical_layout = false;
+            SaveSplitscreenLayoutState(false);
+            Log("SplitscreenOrientation: renderer dimensions unavailable; reverting to Horizontal");
+        }
         return;
     }
 
     const DWORD device_width = *reinterpret_cast<DWORD*>(renderer + 0x08);
     const DWORD device_height = *reinterpret_cast<DWORD*>(renderer + 0x0C);
     if (device_width < 2 || device_height == 0) {
-        g_splitscreen_vertical_layout = false;
-        SaveSplitscreenLayoutState(false);
-        Log("SplitscreenOrientation: invalid device dimensions %lux%lu; reverting to Horizontal",
-            static_cast<unsigned long>(device_width),
-            static_cast<unsigned long>(device_height));
+        if (split_setup_mode) {
+            g_splitscreen_vertical_layout = false;
+            SaveSplitscreenLayoutState(false);
+            Log("SplitscreenOrientation: invalid device dimensions %lux%lu; reverting to Horizontal",
+                static_cast<unsigned long>(device_width),
+                static_cast<unsigned long>(device_height));
+        }
         return;
     }
 
@@ -806,6 +762,37 @@ void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
     const DWORD right_width = device_width - left_width;
     auto* left = layout + 0x34;
     auto* right = left + 0x18;
+
+    // The stock builder early-outs when the requested count has not changed.
+    // Re-derive the latch from the live records so a later no-op call after the
+    // setup mode field clears cannot disable projection and HUD corrections.
+    const bool already_vertical =
+        *reinterpret_cast<DWORD*>(layout + 0x30) == 2 &&
+        *reinterpret_cast<DWORD*>(left + 0x00) == 0 &&
+        *reinterpret_cast<DWORD*>(left + 0x04) == 0 &&
+        *reinterpret_cast<DWORD*>(left + 0x08) == left_width &&
+        *reinterpret_cast<DWORD*>(left + 0x0C) == device_height &&
+        *reinterpret_cast<DWORD*>(left + 0x10) == 0 &&
+        *reinterpret_cast<DWORD*>(left + 0x14) == 0 &&
+        *reinterpret_cast<DWORD*>(right + 0x00) == left_width &&
+        *reinterpret_cast<DWORD*>(right + 0x04) == 0 &&
+        *reinterpret_cast<DWORD*>(right + 0x08) == right_width &&
+        *reinterpret_cast<DWORD*>(right + 0x0C) == device_height &&
+        *reinterpret_cast<DWORD*>(right + 0x10) == 0 &&
+        *reinterpret_cast<DWORD*>(right + 0x14) == 1;
+    if (already_vertical) {
+        g_splitscreen_vertical_render_active = true;
+        return;
+    }
+    if (!split_setup_mode) {
+        return;
+    }
+    if (!IsWritableMemory(layout_object, 0x64)) {
+        g_splitscreen_vertical_layout = false;
+        SaveSplitscreenLayoutState(false);
+        Log("SplitscreenOrientation: viewport layout object is not writable; reverting to Horizontal");
+        return;
+    }
 
     *reinterpret_cast<DWORD*>(layout + 0x30) = 2;
     *reinterpret_cast<DWORD*>(left + 0x00) = 0;
@@ -906,6 +893,55 @@ __declspec(naked) void SplitscreenRaceMapHook4B9BEB()
         // Tail-dispatch to the original __stdcall renderer without using EAX;
         // it is a live implicit argument at this call site.
         push 0x004C5AE0
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenHudBackgroundHook4B8D49()
+{
+    __asm {
+        je normal
+        mov ecx, dword ptr [esp + 0x4C8]
+        cmp dword ptr [ecx + 0x368], 2
+        jne normal
+        cmp byte ptr [g_splitscreen_vertical_render_active], 0
+        jne normal
+        push 0x004B8D5B
+        ret
+    normal:
+        push 0x004B8D6C
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenPositionTitleHook4B9F43()
+{
+    __asm {
+        je normal
+        cmp dword ptr [esp + 0x20], 2
+        jne normal
+        cmp byte ptr [g_splitscreen_vertical_render_active], 0
+        jne normal
+        push 0x004B9F4C
+        ret
+    normal:
+        push 0x004B9F6A
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenPositionValueHook4BA08F()
+{
+    __asm {
+        je normal
+        cmp dword ptr [esp + 0x20], 2
+        jne normal
+        cmp byte ptr [g_splitscreen_vertical_render_active], 0
+        jne normal
+        push 0x004BA098
+        ret
+    normal:
+        push 0x004BA0B6
         ret
     }
 }
@@ -1887,7 +1923,7 @@ struct SplitscreenPatchSite
 
 bool SplitscreenBranchMatches(const SplitscreenPatchSite& site)
 {
-    std::uint8_t expected_branch[16] = {};
+    std::uint8_t expected_branch[32] = {};
     if (site.patch_size < 5 || site.patch_size > sizeof(expected_branch)) {
         return false;
     }
@@ -1930,10 +1966,25 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
     const std::uint8_t secondary_aspect_expected[] = {
         0x8B, 0xC6, 0x83, 0xE8, 0x02, 0x75, 0x02, 0xDC, 0xC0
     };
+    const std::uint8_t hud_background_expected[] = {
+        0x74, 0x21,
+        0x8B, 0x8C, 0x24, 0xC8, 0x04, 0x00, 0x00,
+        0x83, 0xB9, 0x68, 0x03, 0x00, 0x00, 0x02,
+        0x75, 0x11
+    };
+    const std::uint8_t position_title_expected[] = {
+        0x74, 0x25, 0x83, 0x7C, 0x24, 0x20, 0x02, 0x75, 0x1E
+    };
+    const std::uint8_t position_value_expected[] = {
+        0x74, 0x25, 0x83, 0x7C, 0x24, 0x20, 0x02, 0x75, 0x1E
+    };
     const std::uint8_t race_map_expected[] = {0xE8, 0xF0, 0xBE, 0x00, 0x00};
     const SplitscreenPatchSite sites[] = {
         {reinterpret_cast<std::uint8_t*>(0x004C9E27), primary_aspect_expected, sizeof(primary_aspect_expected), sizeof(primary_aspect_expected), reinterpret_cast<void*>(&ProjectionSplitModeHook), "primary-projection-aspect", false},
         {reinterpret_cast<std::uint8_t*>(0x004CBD5D), secondary_aspect_expected, sizeof(secondary_aspect_expected), sizeof(secondary_aspect_expected), reinterpret_cast<void*>(&ProjectionSplitModeSecondaryHook4CBD5D), "secondary-projection-aspect", false},
+        {reinterpret_cast<std::uint8_t*>(0x004B8D49), hud_background_expected, sizeof(hud_background_expected), sizeof(hud_background_expected), reinterpret_cast<void*>(&SplitscreenHudBackgroundHook4B8D49), "vertical-position-background", false},
+        {reinterpret_cast<std::uint8_t*>(0x004B9F43), position_title_expected, sizeof(position_title_expected), sizeof(position_title_expected), reinterpret_cast<void*>(&SplitscreenPositionTitleHook4B9F43), "vertical-position-title", false},
+        {reinterpret_cast<std::uint8_t*>(0x004BA08F), position_value_expected, sizeof(position_value_expected), sizeof(position_value_expected), reinterpret_cast<void*>(&SplitscreenPositionValueHook4BA08F), "vertical-position-value", false},
         {reinterpret_cast<std::uint8_t*>(0x004B9BEB), race_map_expected, sizeof(race_map_expected), sizeof(race_map_expected), reinterpret_cast<void*>(&SplitscreenRaceMapHook4B9BEB), "vertical-race-map-center", true},
         {reinterpret_cast<std::uint8_t*>(0x0045CF1B), layout_call_expected, sizeof(layout_call_expected), sizeof(layout_call_expected), reinterpret_cast<void*>(&SplitscreenViewportLayoutCall45CF1B), "viewport-layout-builder", true},
     };
@@ -1995,23 +2046,6 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
     return true;
 }
 
-bool StockEventTableContains(DWORD event_id)
-{
-    auto* entry = reinterpret_cast<const SplitscreenOrientationEventDescriptor*>(0x00697590);
-    for (size_t index = 0; index < 2048; ++index, ++entry) {
-        if (!IsReadableMemory(entry, sizeof(*entry))) {
-            return true;
-        }
-        if (entry->name == nullptr) {
-            return false;
-        }
-        if (entry->id == event_id) {
-            return true;
-        }
-    }
-    return true;
-}
-
 bool PatchSplitscreenFix(const ModuleRange& range)
 {
     constexpr DWORD kSupportedTimestamp = 0x451D02BD;
@@ -2040,12 +2074,6 @@ bool PatchSplitscreenFix(const ModuleRange& range)
         return false;
     }
 
-    if (StockEventTableContains(kSplitscreenHorizontalEventId) ||
-        StockEventTableContains(kSplitscreenVerticalEventId)) {
-        Log("SplitscreenFix: private orientation event IDs collide with the stock registry; no hooks installed");
-        return false;
-    }
-
     const std::uint8_t count_expected[] = {0x89, 0x7D, 0x14, 0x89, 0x7D, 0x08};
     const std::uint8_t ready_owner_expected[] = {
         0x8B, 0x53, 0x10, 0x8B, 0xC6,
@@ -2057,12 +2085,6 @@ bool PatchSplitscreenFix(const ModuleRange& range)
     const std::uint8_t held_controller_expected[] = {0x3C, 0xFF, 0x74, 0x36, 0x55};
     const std::uint8_t post_processing_expected[] = {
         0x8B, 0x54, 0x24, 0x50, 0x8B, 0xCE, 0xFF, 0x92, 0x50, 0x01, 0x00, 0x00
-    };
-    const std::uint8_t orientation_descriptor_expected[] = {0xE8, 0x56, 0xF4, 0xFF, 0xFF};
-    const std::uint8_t orientation_post_expected[] = {
-        0x39, 0x74, 0x24, 0x08, 0x74, 0x0F,
-        0xA1, 0x14, 0x84, 0x8E, 0x00, 0x56, 0x8D, 0x54, 0x24, 0x0C,
-        0xE8, 0x2B, 0xAA, 0xFC, 0xFF
     };
     const std::uint8_t input_registration_expected[] = {
         0x68, 0xEC, 0x1A, 0x67, 0x00,
@@ -2082,9 +2104,7 @@ bool PatchSplitscreenFix(const ModuleRange& range)
         {reinterpret_cast<std::uint8_t*>(0x0055D705), pressed_controller_expected, sizeof(pressed_controller_expected), sizeof(pressed_controller_expected), reinterpret_cast<void*>(&SplitscreenPressedControllerHook55D705), "pressed-controller", false},
         {reinterpret_cast<std::uint8_t*>(0x0055D785), held_controller_expected, sizeof(held_controller_expected), sizeof(held_controller_expected), reinterpret_cast<void*>(&SplitscreenHeldControllerHook55D785), "held-controller", false},
         {reinterpret_cast<std::uint8_t*>(0x004CBB26), post_processing_expected, sizeof(post_processing_expected), sizeof(post_processing_expected), reinterpret_cast<void*>(&SplitscreenPostProcessingHook4CBB26), "post-processing-viewport", false},
-        {reinterpret_cast<std::uint8_t*>(0x004A738A), input_registration_expected, sizeof(input_registration_expected), 5, reinterpret_cast<void*>(&SplitscreenInputRegistrationHook4A738A), "split-layout-query-binding", false},
-        {reinterpret_cast<std::uint8_t*>(0x0048D2F5), orientation_descriptor_expected, sizeof(orientation_descriptor_expected), sizeof(orientation_descriptor_expected), reinterpret_cast<void*>(&SplitscreenEventDescriptorHook48D2F5), "orientation-event-descriptor", true},
-        {reinterpret_cast<std::uint8_t*>(0x0048D4C0), orientation_post_expected, sizeof(orientation_post_expected), 6, reinterpret_cast<void*>(&SplitscreenPostEventHook48D4C0), "orientation-event-post", false},
+        {reinterpret_cast<std::uint8_t*>(0x004A738A), input_registration_expected, sizeof(input_registration_expected), 5, reinterpret_cast<void*>(&SplitscreenInputRegistrationHook4A738A), "split-layout-query-setter-binding", false},
         {reinterpret_cast<std::uint8_t*>(0x00520F7E), filesystem_expected, sizeof(filesystem_expected), sizeof(filesystem_expected), reinterpret_cast<void*>(&SplitscreenFilesystemHook520F7E), "filesystem-mount", false},
     };
 

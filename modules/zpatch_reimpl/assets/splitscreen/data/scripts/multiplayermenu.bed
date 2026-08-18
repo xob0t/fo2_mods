@@ -285,9 +285,9 @@ local function StartSplitscreen(race, players)
 		end
 	end
 	if players.split_vertical then
-		Event:PostEvent(event(2130837506)) -- 0x7F020002
+		Input.SetSplitscreenLayoutVertical()
 	else
-		Event:PostEvent(event(2130837505)) -- 0x7F020001
+		Input.SetSplitscreenLayoutHorizontal()
 	end
 
 	GameFlow.ClearRace()
