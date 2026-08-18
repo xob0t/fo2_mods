@@ -20,7 +20,9 @@ $files = @(
   "dinput8.dll",
   "fo2_xinput_rumble.ini",
   "fo2_zpatch_reimpl.asi",
-  "fo2_zpatch_reimpl.ini"
+  "fo2_zpatch_reimpl.ini",
+  "fo2_splitscreen.bfs",
+  "fo2_splitscreen_filesystem"
 )
 
 foreach ($file in $files) {

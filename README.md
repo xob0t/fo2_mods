@@ -30,6 +30,8 @@ Install files:
 
 - `fo2_zpatch_reimpl.asi`
 - `fo2_zpatch_reimpl.ini`
+- `fo2_splitscreen.bfs`
+- `fo2_splitscreen_filesystem`
 - `winmm.dll`
 
 Default fixes:
@@ -43,6 +45,9 @@ RemoveVSync=1
 BorderlessWindowed=0
 WidescreenFix=1
 WidescreenFix_FOVScaling=1
+SplitscreenFix=0
+SplitscreenPostProcessingFix=0
+SplitscreenZoomInputFix=1
 ```
 
 Feature notes:
@@ -54,6 +59,9 @@ Feature notes:
 - `RemoveVSync` requests immediate D3D9 presentation.
 - `BorderlessWindowed` is available but disabled by default.
 - `WidescreenFix` and `WidescreenFix_FOVScaling` fix ultrawide/widescreen menu, garage, and race camera behavior.
+- `SplitscreenFix` is an opt-in two-player prototype. The two-player party roster includes inline indexed input-device selectors, stores two distinct zero-based keyboard/pad indices, configures the stock logical local-player count, and keeps its four routing hooks on stock paths outside `GM_SPLITSCREEN`.
+- `SplitscreenPostProcessingFix` is a separate experimental opt-in. It performs the shared post-process once with a full-device viewport and restores player 2's viewport afterward; leave it off if a shader shows seams or edge artifacts.
+- `SplitscreenZoomInputFix` is version- and capability-gated Zoom Platform compatibility. For the verified Zoom build it translates Zoom-synthesized Return back to the originating pad slot during split ready prompts without suppressing the input. Unknown/no-Zoom installations keep the core split fix unchanged.
 
 ## `fo2_xinput_rumble`
 
@@ -107,6 +115,9 @@ Requirements:
 - Windows
 - PowerShell
 - Visual Studio 2022 C++ build tools with the x86 toolchain
+- Rust/Cargo and internet access for the first build only. The build downloads
+  the `bfstool` 1.1.0 source crate, verifies its pinned SHA-256, and compiles it
+  into the ignored `.tools\` cache. Later builds reuse the verified cached tool.
 
 Build all mods:
 
@@ -119,6 +130,8 @@ The top-level build creates `dist\` with all runtime files:
 - `winmm.dll`
 - `fo2_zpatch_reimpl.asi`
 - `fo2_zpatch_reimpl.ini`
+- `fo2_splitscreen.bfs`
+- `fo2_splitscreen_filesystem`
 - `dinput8.dll`
 - `fo2_xinput_rumble.ini`
 - `fo2_skip_track.asi`
@@ -131,3 +144,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 Each module also has its own `build.ps1` for building only that mod.
+
+The split-screen BFS is a generated artifact, not versioned source. Its two
+inputs live under `modules\zpatch_reimpl\assets\splitscreen`; the zpatch module
+build creates a v2/file-version-`05050420` archive, checks that it lists exactly
+the two expected BED paths, extracts it to a temporary directory, and verifies
+both payload hashes before the top-level build copies it into `dist\`. The
+19-byte `fo2_splitscreen_filesystem` file is likewise regenerated without a BOM
+or trailing line ending.
+
+`bfstool` 1.1.0 does not produce byte-identical archive metadata on every run
+because some equal-frequency Huffman metadata is emitted from randomized map
+iteration. Builds are therefore reproducible semantically (same paths and
+payload hashes), but the generated BFS SHA-256 may differ between builds.

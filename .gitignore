@@ -13,6 +13,13 @@
 # Local artifacts
 dist/
 *.log
+.tools/
+
+# Generated split-screen package outputs. The versioned inputs live under
+# modules/zpatch_reimpl/assets/splitscreen.
+modules/zpatch_reimpl/fo2_splitscreen.bfs
+modules/zpatch_reimpl/fo2_splitscreen_filesystem
+modules/zpatch_reimpl/.bfs-audit/
 
 # Local investigation scratch space
 captures/

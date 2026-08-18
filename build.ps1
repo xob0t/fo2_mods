@@ -20,7 +20,7 @@ $modules = @(
   @{
     Name = "zpatch_reimpl"
     Path = Join-Path $PSScriptRoot "modules\zpatch_reimpl"
-    Outputs = @("fo2_zpatch_reimpl.asi", "fo2_zpatch_reimpl.ini")
+    Outputs = @("fo2_zpatch_reimpl.asi", "fo2_zpatch_reimpl.ini", "fo2_splitscreen.bfs", "fo2_splitscreen_filesystem")
   }
 )
 

@@ -4,6 +4,7 @@
 #include <mmsystem.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -22,10 +23,13 @@ bool g_borderless_windowed = false;
 bool g_widescreen_fix = false;
 bool g_widescreen_fov_scaling = false;
 bool g_splitscreen_fix = false;
+bool g_splitscreen_post_processing_fix = false;
+bool g_splitscreen_zoom_input_fix = true;
 bool g_menu_car_backface_culling = true;
 DWORD g_menu_car_max_model_file_size = 524288;
 DWORD g_menu_car_max_skin_file_size = 2097152;
 char g_log_path[MAX_PATH] = {};
+char g_splitscreen_filesystem_name[] = "fo2_splitscreen_filesystem";
 HMODULE g_winmm = nullptr;
 
 using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
@@ -33,6 +37,23 @@ Direct3DCreate9Fn g_real_direct3d_create9 = nullptr;
 using ResetFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 ResetFn g_real_reset = nullptr;
 volatile LONG g_device_hooks_installed = 0;
+using SendInputFn = UINT (WINAPI*)(UINT, LPINPUT, int);
+SendInputFn g_real_zoom_send_input = nullptr;
+void** g_zoom_send_input_iat = nullptr;
+std::uint8_t* g_zoom_module_base = nullptr;
+
+struct ZoomInputLatch {
+    DWORD slot;
+    DWORD ordinal;
+    DWORD tick;
+};
+
+constexpr size_t kZoomInputLatchCapacity = 8;
+constexpr DWORD kZoomInputLatchLifetimeMs = 750;
+SRWLOCK g_zoom_input_latch_lock = SRWLOCK_INIT;
+ZoomInputLatch g_zoom_input_latches[kZoomInputLatchCapacity] = {};
+size_t g_zoom_input_latch_head = 0;
+size_t g_zoom_input_latch_count = 0;
 using TimeBeginPeriodFn = MMRESULT (WINAPI*)(UINT);
 TimeBeginPeriodFn g_time_begin_period = nullptr;
 DWORD g_widescreen_fov_context = 0;
@@ -153,6 +174,10 @@ void LoadConfig()
     g_widescreen_fix = GetPrivateProfileIntA("Fixes", "WidescreenFix", 0, ini_path) != 0;
     g_widescreen_fov_scaling = GetPrivateProfileIntA("Fixes", "WidescreenFix_FOVScaling", 0, ini_path) != 0;
     g_splitscreen_fix = GetPrivateProfileIntA("Fixes", "SplitscreenFix", 0, ini_path) != 0;
+    g_splitscreen_post_processing_fix =
+        GetPrivateProfileIntA("Fixes", "SplitscreenPostProcessingFix", 0, ini_path) != 0;
+    g_splitscreen_zoom_input_fix =
+        GetPrivateProfileIntA("Fixes", "SplitscreenZoomInputFix", 1, ini_path) != 0;
     g_menu_car_backface_culling = GetPrivateProfileIntA("Fixes", "MenuCarBackfaceCulling", 1, ini_path) != 0;
     g_menu_car_max_model_file_size = std::max<DWORD>(GetPrivateProfileIntA("Fixes", "MenuCarMaxModelFileSize", 524288, ini_path), 1);
     g_menu_car_max_skin_file_size = std::max<DWORD>(GetPrivateProfileIntA("Fixes", "MenuCarMaxSkinFileSize", 2097152, ini_path), 1);
@@ -185,6 +210,27 @@ bool WriteJump(void* address, void* destination, size_t size)
     }
 
     patch[0] = 0xE9;
+    *reinterpret_cast<std::int32_t*>(&patch[1]) =
+        static_cast<std::int32_t>(reinterpret_cast<std::uint8_t*>(destination) - reinterpret_cast<std::uint8_t*>(address) - 5);
+    for (size_t i = 5; i < size; ++i) {
+        patch[i] = 0x90;
+    }
+
+    return WriteMemory(address, patch, size);
+}
+
+bool WriteCall(void* address, void* destination, size_t size)
+{
+    if (size < 5) {
+        return false;
+    }
+
+    std::uint8_t patch[32] = {};
+    if (size > sizeof(patch)) {
+        return false;
+    }
+
+    patch[0] = 0xE8;
     *reinterpret_cast<std::int32_t*>(&patch[1]) =
         static_cast<std::int32_t>(reinterpret_cast<std::uint8_t*>(destination) - reinterpret_cast<std::uint8_t*>(address) - 5);
     for (size_t i = 5; i < size; ++i) {
@@ -417,6 +463,515 @@ __declspec(naked) void MenuTransformHeightHook533690()
     }
 }
 
+__declspec(naked) void SplitscreenFilesystemHook520F7E()
+{
+    __asm {
+        // Parse the dedicated split-screen filesystem list before replaying
+        // the stock "-binarydb" argument setup overwritten at 0x00520F7E.
+        // The added parser call is isolated so its register/flag changes are
+        // invisible to the surrounding startup routine.
+        pushfd
+        pushad
+        lea esi, g_splitscreen_filesystem_name
+        mov eax, 0x00520E10
+        call eax
+        popad
+        popfd
+
+        push 0x00677DF8
+        mov eax, 0x00520F83
+        jmp eax
+    }
+}
+
+bool IsSplitscreenMode()
+{
+    auto* game_flow = *reinterpret_cast<std::uint8_t**>(0x008E8410);
+    return game_flow != nullptr && *reinterpret_cast<DWORD*>(game_flow + 0x464) == 10;
+}
+
+bool IsSplitscreenReadyInputState()
+{
+    if (!g_splitscreen_fix || !g_splitscreen_zoom_input_fix) {
+        return false;
+    }
+
+    auto* game_flow = *reinterpret_cast<std::uint8_t**>(0x008E8410);
+    return IsReadableMemory(game_flow, 0x920) &&
+        *reinterpret_cast<DWORD*>(game_flow + 0x464) == 10 &&
+        *reinterpret_cast<DWORD*>(game_flow + 0x91C) == 6;
+}
+
+void ClearZoomInputLatches()
+{
+    AcquireSRWLockExclusive(&g_zoom_input_latch_lock);
+    g_zoom_input_latch_head = 0;
+    g_zoom_input_latch_count = 0;
+    ReleaseSRWLockExclusive(&g_zoom_input_latch_lock);
+}
+
+void EnqueueZoomInputLatch(DWORD slot, DWORD ordinal, DWORD tick)
+{
+    AcquireSRWLockExclusive(&g_zoom_input_latch_lock);
+    if (g_zoom_input_latch_count == kZoomInputLatchCapacity) {
+        g_zoom_input_latch_head = (g_zoom_input_latch_head + 1) % kZoomInputLatchCapacity;
+        --g_zoom_input_latch_count;
+    }
+    const size_t tail = (g_zoom_input_latch_head + g_zoom_input_latch_count) % kZoomInputLatchCapacity;
+    g_zoom_input_latches[tail] = {slot, ordinal, tick};
+    ++g_zoom_input_latch_count;
+    ReleaseSRWLockExclusive(&g_zoom_input_latch_lock);
+}
+
+bool ConsumeFreshZoomInputLatch(DWORD* slot, DWORD* ordinal)
+{
+    if (slot == nullptr || ordinal == nullptr) {
+        return false;
+    }
+
+    const DWORD now = GetTickCount();
+    bool found = false;
+    AcquireSRWLockExclusive(&g_zoom_input_latch_lock);
+    while (g_zoom_input_latch_count != 0) {
+        const ZoomInputLatch item = g_zoom_input_latches[g_zoom_input_latch_head];
+        g_zoom_input_latch_head = (g_zoom_input_latch_head + 1) % kZoomInputLatchCapacity;
+        --g_zoom_input_latch_count;
+        if (now - item.tick <= kZoomInputLatchLifetimeMs) {
+            *slot = item.slot;
+            *ordinal = item.ordinal;
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_zoom_input_latch_lock);
+    return found;
+}
+
+bool ResolveZoomControllerSlot(const void* captured_esi, DWORD* slot)
+{
+    if (captured_esi == nullptr || slot == nullptr || g_zoom_module_base == nullptr) {
+        return false;
+    }
+
+    auto** begin_pointer = reinterpret_cast<std::uint8_t**>(g_zoom_module_base + 0xFECFC);
+    auto** end_pointer = reinterpret_cast<std::uint8_t**>(g_zoom_module_base + 0xFED00);
+    if (!IsReadableMemory(begin_pointer, sizeof(*begin_pointer)) ||
+        !IsReadableMemory(end_pointer, sizeof(*end_pointer))) {
+        return false;
+    }
+
+    auto* begin = *begin_pointer;
+    auto* end = *end_pointer;
+    const auto begin_address = reinterpret_cast<std::uintptr_t>(begin);
+    const auto end_address = reinterpret_cast<std::uintptr_t>(end);
+    const auto edge_address = reinterpret_cast<std::uintptr_t>(captured_esi);
+    constexpr size_t kRecordStride = 0x3C;
+    if (begin == nullptr || end == nullptr || end_address < begin_address ||
+        (end_address - begin_address) % kRecordStride != 0 ||
+        (end_address - begin_address) / kRecordStride > 16) {
+        return false;
+    }
+
+    for (auto* record = begin; record < end; record += kRecordStride) {
+        const auto record_address = reinterpret_cast<std::uintptr_t>(record);
+        if (edge_address < record_address + 0x0C || edge_address > record_address + 0x17) {
+            continue;
+        }
+        if (!IsReadableMemory(record, kRecordStride)) {
+            return false;
+        }
+
+        const DWORD resolved_slot = *reinterpret_cast<DWORD*>(record + 0x34);
+        auto* input_manager = *reinterpret_cast<std::uint8_t**>(0x008E844C);
+        if (!IsReadableMemory(input_manager, 0x20)) {
+            return false;
+        }
+        const DWORD device_count = *reinterpret_cast<DWORD*>(input_manager + 0x04);
+        if (resolved_slot == 0 || resolved_slot >= device_count) {
+            return false;
+        }
+        *slot = resolved_slot;
+        return true;
+    }
+    return false;
+}
+
+bool GetCurrentSplitscreenReadySelection(DWORD* ordinal, DWORD* desired_controller)
+{
+    if (ordinal == nullptr || desired_controller == nullptr || !IsSplitscreenReadyInputState()) {
+        return false;
+    }
+    auto* game_flow = *reinterpret_cast<std::uint8_t**>(0x008E8410);
+    auto* input_manager = *reinterpret_cast<std::uint8_t**>(0x008E844C);
+    if (!IsReadableMemory(game_flow, 0x9D0) || !IsReadableMemory(input_manager, 0x20)) {
+        return false;
+    }
+
+    const DWORD current_ordinal = *reinterpret_cast<DWORD*>(game_flow + 0x9CC);
+    const DWORD device_count = *reinterpret_cast<DWORD*>(input_manager + 0x04);
+    if (current_ordinal >= 2) {
+        return false;
+    }
+    const DWORD current_desired = *reinterpret_cast<DWORD*>(
+        game_flow + 0x624 + current_ordinal * 0x44
+    );
+    if (current_desired >= device_count) {
+        return false;
+    }
+    *ordinal = current_ordinal;
+    *desired_controller = current_desired;
+    return true;
+}
+
+UINT __cdecl HandleZoomSendInput(
+    UINT input_count,
+    LPINPUT inputs,
+    int input_size,
+    const void* captured_esi,
+    const void* return_address
+)
+{
+    if (g_real_zoom_send_input == nullptr) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return 0;
+    }
+
+    if (!IsSplitscreenReadyInputState()) {
+        ClearZoomInputLatches();
+        return g_real_zoom_send_input(input_count, inputs, input_size);
+    }
+    if (input_count == 0 || inputs == nullptr || input_size != sizeof(INPUT) ||
+        input_count > (static_cast<UINT>(~static_cast<size_t>(0)) / sizeof(INPUT)) ||
+        !IsReadableMemory(inputs, static_cast<size_t>(input_count) * sizeof(INPUT))) {
+        return g_real_zoom_send_input(input_count, inputs, input_size);
+    }
+
+    DWORD resolved_slot = 0xFFFFFFFF;
+    DWORD target_ordinal = 0xFFFFFFFF;
+    DWORD desired_controller = 0xFFFFFFFF;
+    const bool ready_selection_valid = GetCurrentSplitscreenReadySelection(
+        &target_ordinal,
+        &desired_controller
+    );
+    const auto down_return = g_zoom_module_base + 0x4711;
+    const auto up_return = g_zoom_module_base + 0x4799;
+    const bool supported_down_call = return_address == down_return;
+    const bool supported_up_call = return_address == up_return;
+    UINT reported_inserted = 0;
+    for (UINT i = 0; i < input_count; ++i) {
+        const INPUT& input = inputs[i];
+        const bool return_key = input.type == INPUT_KEYBOARD && input.ki.wVk == VK_RETURN;
+        const bool return_key_up = return_key && (input.ki.dwFlags & KEYEVENTF_KEYUP) != 0;
+        if (!return_key || return_key_up) {
+            // A stray key-up cannot claim a ready prompt. Always forward it
+            // (including the verified +0x4799 call) so a valid injected
+            // key-down cannot become stuck if controller state changes.
+            reported_inserted += g_real_zoom_send_input(1, &inputs[i], input_size);
+            continue;
+        }
+
+        const bool identity_valid = supported_down_call &&
+            !supported_up_call &&
+            ResolveZoomControllerSlot(captured_esi, &resolved_slot) &&
+            ready_selection_valid &&
+            resolved_slot == desired_controller;
+        if (!identity_valid) {
+            // Fail closed only for an unowned Zoom-generated Return key-down.
+            // Reporting it as inserted prevents retries while ensuring an
+            // unknown or wrong pad cannot masquerade as keyboard slot zero.
+            ++reported_inserted;
+            continue;
+        }
+
+        EnqueueZoomInputLatch(resolved_slot, target_ordinal, GetTickCount());
+        reported_inserted += g_real_zoom_send_input(1, &inputs[i], input_size);
+    }
+    return reported_inserted;
+}
+
+__declspec(naked) UINT WINAPI ProxyZoomSendInput(UINT, LPINPUT, int)
+{
+    __asm {
+        // Zoom's current x86 key-edge helper keeps the exact record edge
+        // pointer in ESI across its SendInput IAT call. Capture it and the IAT
+        // return address before a C prologue can reuse them, then preserve
+        // SendInput's stdcall ABI.
+        mov eax, esp
+        push dword ptr [eax]
+        push esi
+        push dword ptr [eax + 0x0C]
+        push dword ptr [eax + 0x08]
+        push dword ptr [eax + 0x04]
+        call HandleZoomSendInput
+        add esp, 0x14
+        ret 0x0C
+    }
+}
+
+bool __cdecl ShouldAcceptSplitscreenReadyOwner(void* event_object, void*)
+{
+    if (!IsSplitscreenMode()) {
+        ClearZoomInputLatches();
+        return true;
+    }
+
+    auto* event_bytes = static_cast<std::uint8_t*>(event_object);
+    auto* game_flow = *reinterpret_cast<std::uint8_t**>(0x008E8410);
+    auto* input_manager = *reinterpret_cast<std::uint8_t**>(0x008E844C);
+    if (!IsReadableMemory(event_bytes, 0x14) ||
+        !IsReadableMemory(game_flow, 0x9D0) ||
+        !IsReadableMemory(input_manager, 0x20)) {
+        return false;
+    }
+
+    DWORD source_controller = *reinterpret_cast<DWORD*>(event_bytes + 0x10);
+    const DWORD target_ordinal = *reinterpret_cast<DWORD*>(game_flow + 0x9CC);
+    const DWORD device_count = *reinterpret_cast<DWORD*>(input_manager + 0x04);
+    if (target_ordinal >= 2 || source_controller >= device_count) {
+        return false;
+    }
+
+    // GameFlow.PlayerInfo[i] has a 0x44 stride. Controller is the zero-based
+    // DWORD at record +0x10, or game-flow +0x624.
+    const DWORD desired_controller = *reinterpret_cast<DWORD*>(
+        game_flow + 0x624 + target_ordinal * 0x44
+    );
+    if (desired_controller >= device_count) {
+        return false;
+    }
+
+    // Zoom translates pad A/Start into a synthetic keyboard Return, so the
+    // stock event arrives as source zero. A fresh version-gated latch restores
+    // the originating pad before the stock duplicate-source check.
+    DWORD zoom_controller = 0xFFFFFFFF;
+    DWORD zoom_ordinal = 0xFFFFFFFF;
+    if (source_controller == 0 &&
+        ConsumeFreshZoomInputLatch(&zoom_controller, &zoom_ordinal)) {
+        if (zoom_controller != desired_controller || zoom_ordinal != target_ordinal) {
+            return false;
+        }
+        *reinterpret_cast<DWORD*>(event_bytes + 0x10) = zoom_controller;
+        source_controller = zoom_controller;
+    }
+    return source_controller == desired_controller;
+}
+
+using RendererSetViewportFn = void(__thiscall*)(void*, DWORD, DWORD, DWORD, DWORD, DWORD);
+using RendererPostProcessFn = void(__thiscall*)(void*);
+
+void RunSplitscreenPostProcessing(void* renderer, void** renderer_vtable, DWORD viewport_count)
+{
+    const auto post_process = reinterpret_cast<RendererPostProcessFn>(renderer_vtable[0x150 / sizeof(void*)]);
+    if (!g_splitscreen_post_processing_fix || !IsSplitscreenMode() || viewport_count < 2) {
+        post_process(renderer);
+        return;
+    }
+
+    auto* layout = *reinterpret_cast<std::uint8_t**>(0x00696DC8);
+    if (!IsReadableMemory(renderer, 0x10) ||
+        !IsReadableMemory(renderer_vtable, 0x154) ||
+        !IsReadableMemory(layout, 0x5C)) {
+        post_process(renderer);
+        return;
+    }
+
+    const auto set_viewport =
+        reinterpret_cast<RendererSetViewportFn>(renderer_vtable[0x30 / sizeof(void*)]);
+    const DWORD device_width = *reinterpret_cast<DWORD*>(static_cast<std::uint8_t*>(renderer) + 0x08);
+    const DWORD device_height = *reinterpret_cast<DWORD*>(static_cast<std::uint8_t*>(renderer) + 0x0C);
+
+    // The stock site runs one full-device post-process call while the last
+    // player's half-screen viewport is still selected. Temporarily select
+    // the composed device surface, process it once, then restore player 2's
+    // viewport so the following stock render loop sees the expected state.
+    set_viewport(renderer, 0, 0, device_width, device_height, 0);
+    post_process(renderer);
+
+    auto* player_two = layout + 0x18;
+    set_viewport(
+        renderer,
+        *reinterpret_cast<DWORD*>(player_two + 0x34),
+        *reinterpret_cast<DWORD*>(player_two + 0x38),
+        *reinterpret_cast<DWORD*>(player_two + 0x3C),
+        *reinterpret_cast<DWORD*>(player_two + 0x40),
+        1
+    );
+}
+
+__declspec(naked) void SplitscreenPostProcessingHook4CBB26()
+{
+    __asm {
+        // Original stack slots before saving context: viewport count at
+        // +0x24 and the renderer vtable at +0x50. ESI is the renderer.
+        mov eax, dword ptr [esp + 0x24]
+        mov edx, dword ptr [esp + 0x50]
+        pushfd
+        pushad
+        push eax
+        push edx
+        push esi
+        call RunSplitscreenPostProcessing
+        add esp, 0x0C
+        popad
+        popfd
+        push 0x004CBB32
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenPlayerCountHook54FF2E()
+{
+    __asm {
+        // This function runs once during input-manager startup, before a
+        // game-flow mode exists. Preserve stock EDI=1 for the mutable current
+        // player/action context at +0x14, but configure the independent
+        // logical local-player count at +0x08 for two-player split screen.
+        mov dword ptr [ebp + 0x14], edi
+        mov dword ptr [ebp + 0x08], 2
+        push 0x0054FF34
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenReadyOwnerHook45BC5E()
+{
+    __asm {
+        pushfd
+        pushad
+        push esi
+        push ebx
+        call ShouldAcceptSplitscreenReadyOwner
+        add esp, 8
+        test al, al
+        jz rejected
+
+        popad
+        popfd
+        // Replay the stock source load and game-flow context. The following
+        // 0x0045F960 call still performs the stock duplicate-source check.
+        mov edx, dword ptr [ebx + 0x10]
+        mov eax, esi
+        push 0x0045BC63
+        ret
+
+    rejected:
+        popad
+        popfd
+        push 0x0045C2E7
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenHeldRoutingHook55D557()
+{
+    __asm {
+        pushfd
+        pushad
+        call IsSplitscreenMode
+        test al, al
+        jz stock_path
+        popad
+        popfd
+        push 0x0055D574
+        ret
+
+    stock_path:
+        popad
+        popfd
+        cmp dword ptr [edx + 4], 0
+        jne stock_forward
+        push 0x0055D55D
+        ret
+
+    stock_forward:
+        push 0x0055D561
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenPressedRoutingHook55D627()
+{
+    __asm {
+        pushfd
+        pushad
+        call IsSplitscreenMode
+        test al, al
+        jz stock_path
+        popad
+        popfd
+        push 0x0055D644
+        ret
+
+    stock_path:
+        popad
+        popfd
+        cmp dword ptr [edx + 4], 0
+        jne stock_forward
+        push 0x0055D62D
+        ret
+
+    stock_forward:
+        push 0x0055D631
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenPressedControllerHook55D705()
+{
+    __asm {
+        pushfd
+        pushad
+        call IsSplitscreenMode
+        test al, al
+        jz stock_path
+        popad
+        popfd
+        push 0x0055D740
+        ret
+
+    stock_path:
+        popad
+        popfd
+        cmp al, 0xFF
+        je stock_no_controller
+        push ebp
+        push 0x0055D70A
+        ret
+
+    stock_no_controller:
+        push 0x0055D740
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenHeldControllerHook55D785()
+{
+    __asm {
+        pushfd
+        pushad
+        call IsSplitscreenMode
+        test al, al
+        jz stock_path
+        popad
+        popfd
+        push 0x0055D7BF
+        ret
+
+    stock_path:
+        popad
+        popfd
+        cmp al, 0xFF
+        je stock_no_controller
+        push ebp
+        push 0x0055D78A
+        ret
+
+    stock_no_controller:
+        push 0x0055D7BF
+        ret
+    }
+}
+
 HWND GetPresentationWindow(D3DPRESENT_PARAMETERS* presentation_parameters, HWND fallback)
 {
     if (presentation_parameters != nullptr && presentation_parameters->hDeviceWindow != nullptr) {
@@ -605,24 +1160,32 @@ IDirect3D9* WINAPI ProxyDirect3DCreate9(UINT sdk_version)
     return new Direct3D9Proxy(real);
 }
 
-ModuleRange GetExeRange()
+ModuleRange GetModuleRange(HMODULE module)
 {
-    auto* base = reinterpret_cast<std::uint8_t*>(GetModuleHandleA(nullptr));
-    if (base == nullptr) {
+    auto* base = reinterpret_cast<std::uint8_t*>(module);
+    if (!IsReadableMemory(base, sizeof(IMAGE_DOS_HEADER))) {
         return ModuleRange{};
     }
 
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) {
         return ModuleRange{};
     }
 
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+    if (!IsReadableMemory(nt, sizeof(IMAGE_NT_HEADERS)) ||
+        nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+        nt->OptionalHeader.SizeOfImage < sizeof(IMAGE_DOS_HEADER)) {
         return ModuleRange{};
     }
 
     return ModuleRange{base, nt->OptionalHeader.SizeOfImage};
+}
+
+ModuleRange GetExeRange()
+{
+    return GetModuleRange(GetModuleHandleA(nullptr));
 }
 
 std::uint8_t* FindBytes(const ModuleRange& range, const std::uint8_t* bytes, size_t size)
@@ -842,6 +1405,376 @@ void FormatBytes(const std::uint8_t* bytes, size_t size, char* output, size_t ou
     }
 }
 
+bool GameFileExists(const char* name)
+{
+    char path[MAX_PATH] = {};
+    BuildGamePath(path, MAX_PATH, name);
+    const DWORD attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+bool GameFileHasExactBytes(const char* name, const char* expected)
+{
+    char path[MAX_PATH] = {};
+    BuildGamePath(path, MAX_PATH, name);
+    HANDLE file = CreateFileA(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    LARGE_INTEGER size = {};
+    const size_t expected_size = std::strlen(expected);
+    if (!GetFileSizeEx(file, &size) || size.QuadPart != static_cast<LONGLONG>(expected_size)) {
+        CloseHandle(file);
+        return false;
+    }
+
+    char contents[64] = {};
+    DWORD bytes_read = 0;
+    const bool ok = expected_size < sizeof(contents) &&
+        ReadFile(file, contents, static_cast<DWORD>(expected_size), &bytes_read, nullptr) &&
+        bytes_read == expected_size &&
+        std::memcmp(contents, expected, expected_size) == 0;
+    CloseHandle(file);
+    return ok;
+}
+
+struct SplitscreenPatchSite
+{
+    std::uint8_t* address;
+    const std::uint8_t* expected;
+    size_t expected_size;
+    size_t patch_size;
+    void* hook;
+    const char* label;
+    bool call;
+};
+
+bool SplitscreenBranchMatches(const SplitscreenPatchSite& site)
+{
+    std::uint8_t expected_branch[16] = {};
+    if (site.patch_size < 5 || site.patch_size > sizeof(expected_branch)) {
+        return false;
+    }
+
+    expected_branch[0] = site.call ? 0xE8 : 0xE9;
+    *reinterpret_cast<std::int32_t*>(&expected_branch[1]) =
+        static_cast<std::int32_t>(
+            reinterpret_cast<std::uint8_t*>(site.hook) - site.address - 5
+        );
+    for (size_t i = 5; i < site.patch_size; ++i) {
+        expected_branch[i] = 0x90;
+    }
+    return std::memcmp(site.address, expected_branch, site.patch_size) == 0;
+}
+
+bool PatchSplitscreenFix(const ModuleRange& range)
+{
+    constexpr DWORD kSupportedTimestamp = 0x451D02BD;
+    if (reinterpret_cast<std::uintptr_t>(range.base) != 0x00400000 || range.size != 0x00541000) {
+        Log(
+            "SplitscreenFix: unsupported executable layout base=0x%p size=0x%lX",
+            range.base,
+            static_cast<unsigned long>(range.size)
+        );
+        return false;
+    }
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(range.base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(range.base + dos->e_lfanew);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.TimeDateStamp != kSupportedTimestamp) {
+        Log("SplitscreenFix: unsupported executable PE signature/timestamp");
+        return false;
+    }
+
+    if (!GameFileExists("fo2_splitscreen.bfs") ||
+        !GameFileHasExactBytes(g_splitscreen_filesystem_name, "fo2_splitscreen.bfs")) {
+        Log(
+            "SplitscreenFix: missing BFS or filesystem list is not exactly 'fo2_splitscreen.bfs' with no line ending; no hooks installed"
+        );
+        return false;
+    }
+
+    const std::uint8_t count_expected[] = {0x89, 0x7D, 0x14, 0x89, 0x7D, 0x08};
+    const std::uint8_t ready_owner_expected[] = {
+        0x8B, 0x53, 0x10, 0x8B, 0xC6,
+        0xE8, 0xF8, 0x3C, 0x00, 0x00, 0x85, 0xC0, 0x0F, 0x84, 0x77, 0x06, 0x00, 0x00
+    };
+    const std::uint8_t held_route_expected[] = {0x83, 0x7A, 0x04, 0x00, 0x75, 0x04};
+    const std::uint8_t pressed_route_expected[] = {0x83, 0x7A, 0x04, 0x00, 0x75, 0x04};
+    const std::uint8_t pressed_controller_expected[] = {0x3C, 0xFF, 0x74, 0x37, 0x55};
+    const std::uint8_t held_controller_expected[] = {0x3C, 0xFF, 0x74, 0x36, 0x55};
+    const std::uint8_t post_processing_expected[] = {
+        0x8B, 0x54, 0x24, 0x50, 0x8B, 0xCE, 0xFF, 0x92, 0x50, 0x01, 0x00, 0x00
+    };
+    const std::uint8_t filesystem_expected[] = {0x68, 0xF8, 0x7D, 0x67, 0x00};
+
+    // Install the startup mount last. The replacement script therefore
+    // cannot select GM_SPLITSCREEN until the feature-scoped two-slot setup
+    // and every mode-scoped routing detour are already live. All signatures
+    // are checked before the first write.
+    const SplitscreenPatchSite sites[] = {
+        {reinterpret_cast<std::uint8_t*>(0x0054FF2E), count_expected, sizeof(count_expected), sizeof(count_expected), reinterpret_cast<void*>(&SplitscreenPlayerCountHook54FF2E), "logical-player-count", false},
+        {reinterpret_cast<std::uint8_t*>(0x0045BC5E), ready_owner_expected, sizeof(ready_owner_expected), 5, reinterpret_cast<void*>(&SplitscreenReadyOwnerHook45BC5E), "ready-owner-guard", false},
+        {reinterpret_cast<std::uint8_t*>(0x0055D557), held_route_expected, sizeof(held_route_expected), sizeof(held_route_expected), reinterpret_cast<void*>(&SplitscreenHeldRoutingHook55D557), "held-routing", false},
+        {reinterpret_cast<std::uint8_t*>(0x0055D627), pressed_route_expected, sizeof(pressed_route_expected), sizeof(pressed_route_expected), reinterpret_cast<void*>(&SplitscreenPressedRoutingHook55D627), "pressed-routing", false},
+        {reinterpret_cast<std::uint8_t*>(0x0055D705), pressed_controller_expected, sizeof(pressed_controller_expected), sizeof(pressed_controller_expected), reinterpret_cast<void*>(&SplitscreenPressedControllerHook55D705), "pressed-controller", false},
+        {reinterpret_cast<std::uint8_t*>(0x0055D785), held_controller_expected, sizeof(held_controller_expected), sizeof(held_controller_expected), reinterpret_cast<void*>(&SplitscreenHeldControllerHook55D785), "held-controller", false},
+        {reinterpret_cast<std::uint8_t*>(0x004CBB26), post_processing_expected, sizeof(post_processing_expected), sizeof(post_processing_expected), reinterpret_cast<void*>(&SplitscreenPostProcessingHook4CBB26), "post-processing-viewport", false},
+        {reinterpret_cast<std::uint8_t*>(0x00520F7E), filesystem_expected, sizeof(filesystem_expected), sizeof(filesystem_expected), reinterpret_cast<void*>(&SplitscreenFilesystemHook520F7E), "filesystem-mount", false},
+    };
+
+    for (const SplitscreenPatchSite& site : sites) {
+        if (std::memcmp(site.address, site.expected, site.expected_size) != 0) {
+            char actual[64] = {};
+            FormatBytes(site.address, site.expected_size, actual, sizeof(actual));
+            Log(
+                "SplitscreenFix: signature mismatch for %s at 0x%p actual=%s; no hooks installed",
+                site.label,
+                site.address,
+                actual
+            );
+            return false;
+        }
+    }
+
+    size_t installed = 0;
+    for (; installed < sizeof(sites) / sizeof(sites[0]); ++installed) {
+        const SplitscreenPatchSite& site = sites[installed];
+        const bool wrote = site.call
+            ? WriteCall(site.address, site.hook, site.patch_size)
+            : WriteJump(site.address, site.hook, site.patch_size);
+        if (!wrote || !SplitscreenBranchMatches(site)) {
+            Log("SplitscreenFix: failed to install/verify %s; rolling back", site.label);
+            if (std::memcmp(site.address, site.expected, site.patch_size) != 0) {
+                WriteMemory(site.address, site.expected, site.patch_size);
+            }
+            break;
+        }
+    }
+
+    if (installed != sizeof(sites) / sizeof(sites[0])) {
+        while (installed > 0) {
+            --installed;
+            const SplitscreenPatchSite& site = sites[installed];
+            WriteMemory(site.address, site.expected, site.patch_size);
+        }
+        return false;
+    }
+
+    Log(
+        "SplitscreenFix: mounted fo2_splitscreen.bfs; logical local-player count=2 with stock current-player context=1; ready/start ownership follows explicit PlayerInfo.Controller selections; four input-routing hooks are mode-scoped; explicit script-selected input indices are active; full-device post-processing=%d",
+        g_splitscreen_post_processing_fix ? 1 : 0
+    );
+    return true;
+}
+
+bool ModuleRvaContains(const ModuleRange& range, DWORD rva, size_t size)
+{
+    return range.base != nullptr && rva <= range.size && size <= range.size - rva;
+}
+
+bool ModuleStringEquals(const ModuleRange& range, DWORD rva, const char* expected, bool ignore_case)
+{
+    if (expected == nullptr) {
+        return false;
+    }
+    for (size_t i = 0;; ++i) {
+        if (i > MAX_PATH || !ModuleRvaContains(range, rva, i + 1)) {
+            return false;
+        }
+        const unsigned char actual = range.base[rva + i];
+        const unsigned char wanted = static_cast<unsigned char>(expected[i]);
+        const unsigned char folded_actual = ignore_case && actual >= 'A' && actual <= 'Z'
+            ? static_cast<unsigned char>(actual - 'A' + 'a')
+            : actual;
+        const unsigned char folded_wanted = ignore_case && wanted >= 'A' && wanted <= 'Z'
+            ? static_cast<unsigned char>(wanted - 'A' + 'a')
+            : wanted;
+        if (folded_actual != folded_wanted) {
+            return false;
+        }
+        if (wanted == '\0') {
+            return true;
+        }
+    }
+}
+
+void** FindImportIatSlotByName(const ModuleRange& range, const char* dll_name, const char* import_name)
+{
+    if (range.base == nullptr || !IsReadableMemory(range.base, sizeof(IMAGE_DOS_HEADER))) {
+        return nullptr;
+    }
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(range.base);
+    if (!ModuleRvaContains(range, static_cast<DWORD>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS))) {
+        return nullptr;
+    }
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(range.base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (directory.VirtualAddress == 0 || directory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR) ||
+        !ModuleRvaContains(range, directory.VirtualAddress, directory.Size)) {
+        return nullptr;
+    }
+
+    const DWORD descriptor_count = directory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    for (DWORD descriptor_index = 0; descriptor_index < descriptor_count; ++descriptor_index) {
+        auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+            range.base + directory.VirtualAddress + descriptor_index * sizeof(IMAGE_IMPORT_DESCRIPTOR)
+        );
+        if (descriptor->Name == 0) {
+            break;
+        }
+        if (!ModuleStringEquals(range, descriptor->Name, dll_name, true) ||
+            descriptor->OriginalFirstThunk == 0 || descriptor->FirstThunk == 0) {
+            continue;
+        }
+
+        for (DWORD thunk_index = 0;; ++thunk_index) {
+            const size_t thunk_offset = static_cast<size_t>(thunk_index) * sizeof(IMAGE_THUNK_DATA);
+            const size_t original_rva = static_cast<size_t>(descriptor->OriginalFirstThunk) + thunk_offset;
+            const size_t iat_rva = static_cast<size_t>(descriptor->FirstThunk) + thunk_offset;
+            if (original_rva > MAXDWORD || iat_rva > MAXDWORD ||
+                !ModuleRvaContains(range, static_cast<DWORD>(original_rva), sizeof(IMAGE_THUNK_DATA)) ||
+                !ModuleRvaContains(range, static_cast<DWORD>(iat_rva), sizeof(IMAGE_THUNK_DATA))) {
+                break;
+            }
+            auto* original_thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+                range.base + original_rva
+            );
+            auto* iat_thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+                range.base + iat_rva
+            );
+            if (original_thunk->u1.AddressOfData == 0) {
+                break;
+            }
+            if (IMAGE_SNAP_BY_ORDINAL(original_thunk->u1.Ordinal)) {
+                continue;
+            }
+            const size_t name_rva = static_cast<size_t>(original_thunk->u1.AddressOfData) +
+                offsetof(IMAGE_IMPORT_BY_NAME, Name);
+            if (name_rva <= MAXDWORD && ModuleStringEquals(range, static_cast<DWORD>(name_rva), import_name, false)) {
+                return reinterpret_cast<void**>(&iat_thunk->u1.Function);
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool AtomicReplacePointer(void** slot, void* expected, void* replacement)
+{
+    if (slot == nullptr) {
+        return false;
+    }
+    DWORD old_protect = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protect)) {
+        return false;
+    }
+    void* previous = InterlockedCompareExchangePointer(
+        reinterpret_cast<PVOID volatile*>(slot),
+        replacement,
+        expected
+    );
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(void*), old_protect, &ignored);
+    return previous == expected;
+}
+
+void RestoreSplitscreenZoomInputFix()
+{
+    void** slot = g_zoom_send_input_iat;
+    void* original = reinterpret_cast<void*>(g_real_zoom_send_input);
+    if (slot != nullptr && original != nullptr && *slot == reinterpret_cast<void*>(&ProxyZoomSendInput)) {
+        AtomicReplacePointer(slot, reinterpret_cast<void*>(&ProxyZoomSendInput), original);
+    }
+    ClearZoomInputLatches();
+    g_zoom_send_input_iat = nullptr;
+    g_real_zoom_send_input = nullptr;
+    g_zoom_module_base = nullptr;
+}
+
+void PatchSplitscreenZoomInputFix()
+{
+    HMODULE zoom_module = GetModuleHandleA("fo2_zoom.dll");
+    if (zoom_module == nullptr) {
+        Log("SplitscreenZoomInputFix: fo2_zoom.dll absent; compatibility hook not needed");
+        return;
+    }
+
+    const ModuleRange zoom = GetModuleRange(zoom_module);
+    if (zoom.base == nullptr) {
+        Log("SplitscreenZoomInputFix: fo2_zoom.dll has an invalid PE image; compatibility hook skipped");
+        return;
+    }
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(zoom.base);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(zoom.base + dos->e_lfanew);
+    constexpr DWORD kSupportedZoomTimestamp = 0x692D78D4;
+    constexpr DWORD kSupportedZoomImageSize = 0x00106000;
+    if (nt->FileHeader.TimeDateStamp != kSupportedZoomTimestamp ||
+        zoom.size != kSupportedZoomImageSize) {
+        Log(
+            "SplitscreenZoomInputFix: unsupported fo2_zoom.dll timestamp=0x%08lX image_size=0x%lX; identity translation not installed",
+            static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+            static_cast<unsigned long>(zoom.size)
+        );
+        return;
+    }
+
+    void** slot = FindImportIatSlotByName(zoom, "USER32.dll", "SendInput");
+    if (slot == nullptr) {
+        Log(
+            "SplitscreenZoomInputFix: USER32!SendInput import absent in fo2_zoom.dll timestamp=0x%08lX image_size=0x%lX; compatibility hook skipped",
+            static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+            static_cast<unsigned long>(zoom.size)
+        );
+        return;
+    }
+
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    void* real_send_input = user32 != nullptr
+        ? reinterpret_cast<void*>(GetProcAddress(user32, "SendInput"))
+        : nullptr;
+    void* current_target = *slot;
+    if (real_send_input == nullptr || current_target != real_send_input) {
+        Log(
+            "SplitscreenZoomInputFix: unexpected SendInput IAT target slot=0x%p target=0x%p user32=0x%p; compatibility hook skipped",
+            slot,
+            current_target,
+            real_send_input
+        );
+        return;
+    }
+
+    g_real_zoom_send_input = reinterpret_cast<SendInputFn>(current_target);
+    g_zoom_send_input_iat = slot;
+    g_zoom_module_base = zoom.base;
+    ClearZoomInputLatches();
+    if (!AtomicReplacePointer(slot, current_target, reinterpret_cast<void*>(&ProxyZoomSendInput))) {
+        g_zoom_send_input_iat = nullptr;
+        g_real_zoom_send_input = nullptr;
+        g_zoom_module_base = nullptr;
+        Log("SplitscreenZoomInputFix: failed atomic USER32!SendInput IAT replacement; compatibility hook skipped");
+        return;
+    }
+
+    Log(
+        "SplitscreenZoomInputFix: installed version-gated Zoom pad-identity translation slot=0x%p rva=0x%lX original=0x%p timestamp=0x%08lX image_size=0x%lX vector_rvas=0xFECFC/0xFED00 stride=0x3C",
+        slot,
+        static_cast<unsigned long>(reinterpret_cast<std::uint8_t*>(slot) - zoom.base),
+        current_target,
+        static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+        static_cast<unsigned long>(zoom.size)
+    );
+}
+
 bool PatchWidescreenFix()
 {
     int screen_width = GetSystemMetrics(SM_CXSCREEN);
@@ -1035,7 +1968,7 @@ void ApplyPatches()
     const ModuleRange exe = GetExeRange();
     Log("FO2 ZPatch reimplementation attached: exe=0x%p size=0x%lX", exe.base, static_cast<unsigned long>(exe.size));
     Log(
-        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
+        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d SplitscreenPostProcessingFix=%d SplitscreenZoomInputFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
         g_log_enabled ? 1 : 0,
         g_skip_license_screen ? 1 : 0,
         g_skip_intro ? 1 : 0,
@@ -1046,10 +1979,19 @@ void ApplyPatches()
         g_widescreen_fix ? 1 : 0,
         g_widescreen_fov_scaling ? 1 : 0,
         g_splitscreen_fix ? 1 : 0,
+        g_splitscreen_post_processing_fix ? 1 : 0,
+        g_splitscreen_zoom_input_fix ? 1 : 0,
         g_menu_car_backface_culling ? 1 : 0,
         static_cast<unsigned long>(g_menu_car_max_model_file_size),
         static_cast<unsigned long>(g_menu_car_max_skin_file_size)
     );
+
+    if (g_splitscreen_fix) {
+        const bool splitscreen_installed = PatchSplitscreenFix(exe);
+        if (splitscreen_installed && g_splitscreen_zoom_input_fix) {
+            PatchSplitscreenZoomInputFix();
+        }
+    }
 
     if (g_skip_license_screen) {
         PatchSkipLicenseScreen();
@@ -1093,6 +2035,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (thread != nullptr) {
             CloseHandle(thread);
         }
+    } else if (reason == DLL_PROCESS_DETACH) {
+        RestoreSplitscreenZoomInputFix();
     }
     return TRUE;
 }
