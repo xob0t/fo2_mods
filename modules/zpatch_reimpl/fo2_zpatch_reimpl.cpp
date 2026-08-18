@@ -656,12 +656,12 @@ bool IsSplitscreenMode()
     return game_flow != nullptr && *reinterpret_cast<DWORD*>(game_flow + 0x464) == 10;
 }
 
-bool HandleSplitscreenOrientationEvent(const DWORD* event_data)
+DWORD HandleSplitscreenOrientationEvent(const DWORD* event_data)
 {
     if (event_data == nullptr ||
         (event_data[0] != kSplitscreenHorizontalEventId &&
          event_data[0] != kSplitscreenVerticalEventId)) {
-        return false;
+        return 0;
     }
 
     const bool requested_vertical = event_data[0] == kSplitscreenVerticalEventId;
@@ -676,7 +676,7 @@ bool HandleSplitscreenOrientationEvent(const DWORD* event_data)
         g_splitscreen_vertical_layout ? "Vertical" : "Horizontal",
         saved ? "saved" : "failed"
     );
-    return true;
+    return 1;
 }
 
 __declspec(naked) void SplitscreenEventDescriptorHook48D2F5()
@@ -706,6 +706,10 @@ __declspec(naked) void SplitscreenPostEventHook48D4C0()
         push eax
         call HandleSplitscreenOrientationEvent
         add esp, 4
+        // MSVC is permitted to materialize a bool return in AL only. Normalize
+        // the full register before preserving it so stale event-pointer bits
+        // cannot make ordinary stock events look like handled private events.
+        movzx eax, al
         mov dword ptr [esp + 0x1C], eax
         popad
         popfd
