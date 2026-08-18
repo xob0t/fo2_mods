@@ -46,7 +46,6 @@ BorderlessWindowed=0
 WidescreenFix=1
 WidescreenFix_FOVScaling=1
 SplitscreenFix=0
-SplitscreenOrientation=Vertical
 SplitscreenPostProcessingFix=0
 SplitscreenZoomInputFix=1
 ```
@@ -61,7 +60,7 @@ Feature notes:
 - `BorderlessWindowed` is available but disabled by default.
 - `WidescreenFix` and `WidescreenFix_FOVScaling` fix ultrawide/widescreen menu, garage, and race camera behavior.
 - `SplitscreenFix` is an opt-in two-player prototype. The two-player party roster includes inline indexed input-device selectors, stores two distinct zero-based keyboard/pad indices, configures the stock logical local-player count, and keeps its four routing hooks on stock paths outside `GM_SPLITSCREEN`.
-- `SplitscreenOrientation` selects `Vertical` left/right viewports or the stock-compatible `Horizontal` top/bottom layout. Missing or invalid values safely fall back to `Horizontal`; the shipped INI selects `Vertical`.
+- Split orientation is selected at runtime from the split-screen party setup and persisted in `fo2_splitscreen_layout.lua`. `Vertical` uses left/right viewports and `Horizontal` uses top/bottom viewports; missing state defaults to `Vertical` and the native hooks safely fall back to `Horizontal` if layout support cannot be installed.
 - `SplitscreenPostProcessingFix` is a separate experimental opt-in. It performs the shared post-process once with a full-device viewport and restores the final player viewport afterward; leave it off if a shader shows seams or edge artifacts.
 - `SplitscreenZoomInputFix` is version- and capability-gated Zoom Platform compatibility. For the verified Zoom build it translates Zoom-synthesized Return back to the originating pad slot during split ready prompts without suppressing the input. Unknown/no-Zoom installations keep the core split fix unchanged.
 

@@ -25,12 +25,13 @@ bool g_widescreen_fov_scaling = false;
 bool g_splitscreen_fix = false;
 bool g_splitscreen_post_processing_fix = false;
 bool g_splitscreen_zoom_input_fix = true;
-bool g_splitscreen_vertical_layout = false;
-bool g_splitscreen_vertical_layout_requested = false;
+bool g_splitscreen_vertical_layout = true;
+bool g_splitscreen_vertical_capable = false;
 bool g_menu_car_backface_culling = true;
 DWORD g_menu_car_max_model_file_size = 524288;
 DWORD g_menu_car_max_skin_file_size = 2097152;
 char g_log_path[MAX_PATH] = {};
+char g_splitscreen_layout_state_path[MAX_PATH] = {};
 char g_splitscreen_filesystem_name[] = "fo2_splitscreen_filesystem";
 HMODULE g_winmm = nullptr;
 
@@ -69,6 +70,26 @@ const float* g_menu_transform_source = nullptr;
 float* g_menu_transform_stack = nullptr;
 DWORD g_projection_split_mode = 0;
 float g_projection_vertical_aspect_scale = 0.5f;
+constexpr DWORD kSplitscreenHorizontalEventId = 0x7F020001;
+constexpr DWORD kSplitscreenVerticalEventId = 0x7F020002;
+
+struct SplitscreenOrientationEventDescriptor
+{
+    const char* name;
+    DWORD id;
+    DWORD flags;
+};
+
+const SplitscreenOrientationEventDescriptor g_splitscreen_horizontal_event = {
+    "FO2_SPLITSCREEN_HORIZONTAL",
+    kSplitscreenHorizontalEventId,
+    0
+};
+const SplitscreenOrientationEventDescriptor g_splitscreen_vertical_event = {
+    "FO2_SPLITSCREEN_VERTICAL",
+    kSplitscreenVerticalEventId,
+    0
+};
 DWORD FloatBits(float value)
 {
     DWORD bits = 0;
@@ -172,11 +193,95 @@ void Log(const char* fmt, ...)
     std::fclose(file);
 }
 
+bool SaveSplitscreenLayoutState(bool vertical);
+
+void LoadSplitscreenLayoutState()
+{
+    g_splitscreen_vertical_layout = true;
+    HANDLE file = CreateFileA(
+        g_splitscreen_layout_state_path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        SaveSplitscreenLayoutState(true);
+        return;
+    }
+
+    const DWORD file_size = GetFileSize(file, nullptr);
+    if (file_size != 8) {
+        CloseHandle(file);
+        SaveSplitscreenLayoutState(true);
+        return;
+    }
+
+    char contents[9] = {};
+    DWORD bytes_read = 0;
+    const BOOL read_ok = ReadFile(file, contents, 8, &bytes_read, nullptr);
+    CloseHandle(file);
+    if (!read_ok) {
+        SaveSplitscreenLayoutState(true);
+        return;
+    }
+
+    if (bytes_read == 8 && std::memcmp(contents, "return 0", 8) == 0) {
+        g_splitscreen_vertical_layout = false;
+    } else if (bytes_read == 8 && std::memcmp(contents, "return 1", 8) == 0) {
+        g_splitscreen_vertical_layout = true;
+    } else {
+        SaveSplitscreenLayoutState(true);
+    }
+}
+
+bool SaveSplitscreenLayoutState(bool vertical)
+{
+    char temporary_path[MAX_PATH] = {};
+    std::snprintf(
+        temporary_path,
+        sizeof(temporary_path),
+        "%s.tmp-%lu",
+        g_splitscreen_layout_state_path,
+        static_cast<unsigned long>(GetCurrentProcessId())
+    );
+
+    HANDLE file = CreateFileA(
+        temporary_path,
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    const char* contents = vertical ? "return 1" : "return 0";
+    DWORD bytes_written = 0;
+    const BOOL write_ok = WriteFile(file, contents, 8, &bytes_written, nullptr);
+    const BOOL flush_ok = write_ok && bytes_written == 8 && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!flush_ok || !MoveFileExA(
+            temporary_path,
+            g_splitscreen_layout_state_path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temporary_path);
+        return false;
+    }
+    return true;
+}
+
 void LoadConfig()
 {
     char ini_path[MAX_PATH] = {};
     BuildGamePath(ini_path, MAX_PATH, "fo2_zpatch_reimpl.ini");
     BuildGamePath(g_log_path, MAX_PATH, "fo2_zpatch_reimpl.log");
+    BuildGamePath(g_splitscreen_layout_state_path, MAX_PATH, "fo2_splitscreen_layout.lua");
 
     g_log_enabled = GetPrivateProfileIntA("General", "Log", 1, ini_path) != 0;
     g_skip_license_screen = GetPrivateProfileIntA("Fixes", "SkipLicenseScreen", 1, ini_path) != 0;
@@ -192,22 +297,8 @@ void LoadConfig()
         GetPrivateProfileIntA("Fixes", "SplitscreenPostProcessingFix", 0, ini_path) != 0;
     g_splitscreen_zoom_input_fix =
         GetPrivateProfileIntA("Fixes", "SplitscreenZoomInputFix", 1, ini_path) != 0;
-    char splitscreen_orientation[16] = {};
-    GetPrivateProfileStringA(
-        "Fixes",
-        "SplitscreenOrientation",
-        "Horizontal",
-        splitscreen_orientation,
-        static_cast<DWORD>(sizeof(splitscreen_orientation)),
-        ini_path
-    );
-    g_splitscreen_vertical_layout_requested = _stricmp(splitscreen_orientation, "Vertical") == 0;
-    if (!g_splitscreen_vertical_layout_requested &&
-        _stricmp(splitscreen_orientation, "Horizontal") != 0) {
-        Log(
-            "SplitscreenOrientation: unknown value '%s'; falling back to Horizontal",
-            splitscreen_orientation
-        );
+    if (g_splitscreen_fix) {
+        LoadSplitscreenLayoutState();
     }
     g_menu_car_backface_culling = GetPrivateProfileIntA("Fixes", "MenuCarBackfaceCulling", 1, ini_path) != 0;
     g_menu_car_max_model_file_size = std::max<DWORD>(GetPrivateProfileIntA("Fixes", "MenuCarMaxModelFileSize", 524288, ini_path), 1);
@@ -565,6 +656,76 @@ bool IsSplitscreenMode()
     return game_flow != nullptr && *reinterpret_cast<DWORD*>(game_flow + 0x464) == 10;
 }
 
+bool HandleSplitscreenOrientationEvent(const DWORD* event_data)
+{
+    if (event_data == nullptr ||
+        (event_data[0] != kSplitscreenHorizontalEventId &&
+         event_data[0] != kSplitscreenVerticalEventId)) {
+        return false;
+    }
+
+    const bool requested_vertical = event_data[0] == kSplitscreenVerticalEventId;
+    const bool requested_active = requested_vertical && g_splitscreen_vertical_capable;
+    const bool saved = SaveSplitscreenLayoutState(requested_active);
+    if (saved) {
+        g_splitscreen_vertical_layout = requested_active;
+    }
+    Log(
+        "Splitscreen layout UI: requested=%s active=%s persistence=%s",
+        requested_vertical ? "Vertical" : "Horizontal",
+        g_splitscreen_vertical_layout ? "Vertical" : "Horizontal",
+        saved ? "saved" : "failed"
+    );
+    return true;
+}
+
+__declspec(naked) void SplitscreenEventDescriptorHook48D2F5()
+{
+    __asm {
+        cmp esi, 0x7F020001
+        je horizontal
+        cmp esi, 0x7F020002
+        je vertical
+        mov eax, 0x0048C750
+        jmp eax
+    horizontal:
+        lea eax, g_splitscreen_horizontal_event
+        ret
+    vertical:
+        lea eax, g_splitscreen_vertical_event
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenPostEventHook48D4C0()
+{
+    __asm {
+        lea eax, [esp + 0x08]
+        pushfd
+        pushad
+        push eax
+        call HandleSplitscreenOrientationEvent
+        add esp, 4
+        mov dword ptr [esp + 0x1C], eax
+        popad
+        popfd
+        test eax, eax
+        jne swallowed
+
+        // Replay the six bytes overwritten at 0x0048D4C0. A normal event
+        // continues through the stock queue call; a null event keeps the
+        // original short path to the wrapper epilogue.
+        cmp dword ptr [esp + 0x08], esi
+        je stock_done
+        mov eax, 0x0048D4C6
+        jmp eax
+    swallowed:
+    stock_done:
+        mov eax, 0x0048D4D5
+        jmp eax
+    }
+}
+
 void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
 {
     if (!g_splitscreen_vertical_layout || viewport_count != 2 || !IsSplitscreenMode()) {
@@ -573,6 +734,7 @@ void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
 
     if (!IsWritableMemory(layout_object, 0x64)) {
         g_splitscreen_vertical_layout = false;
+        SaveSplitscreenLayoutState(false);
         Log("SplitscreenOrientation: invalid viewport layout object; reverting to Horizontal");
         return;
     }
@@ -580,6 +742,7 @@ void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
     auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
     if (!IsReadableMemory(renderer, 0x10)) {
         g_splitscreen_vertical_layout = false;
+        SaveSplitscreenLayoutState(false);
         Log("SplitscreenOrientation: renderer dimensions unavailable; reverting to Horizontal");
         return;
     }
@@ -588,6 +751,7 @@ void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
     const DWORD device_height = *reinterpret_cast<DWORD*>(renderer + 0x0C);
     if (device_width < 2 || device_height == 0) {
         g_splitscreen_vertical_layout = false;
+        SaveSplitscreenLayoutState(false);
         Log("SplitscreenOrientation: invalid device dimensions %lux%lu; reverting to Horizontal",
             static_cast<unsigned long>(device_width),
             static_cast<unsigned long>(device_height));
@@ -1667,11 +1831,9 @@ bool SplitscreenBranchMatches(const SplitscreenPatchSite& site)
 
 bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
 {
+    const bool selected_vertical = g_splitscreen_vertical_layout;
     g_splitscreen_vertical_layout = false;
-    if (!g_splitscreen_vertical_layout_requested) {
-        Log("SplitscreenOrientation: Horizontal");
-        return true;
-    }
+    g_splitscreen_vertical_capable = false;
 
     const std::uint8_t layout_context_expected[] = {
         0x8B, 0x44, 0x24, 0x14,
@@ -1682,6 +1844,7 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
     if (!ModuleContains(range, reinterpret_cast<void*>(0x0045CF11), sizeof(layout_context_expected)) ||
         std::memcmp(reinterpret_cast<void*>(0x0045CF11), layout_context_expected, sizeof(layout_context_expected)) != 0) {
         Log("SplitscreenOrientation: viewport-builder caller mismatch; falling back to Horizontal");
+        SaveSplitscreenLayoutState(false);
         return false;
     }
 
@@ -1713,6 +1876,7 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
                 site.address,
                 actual
             );
+            SaveSplitscreenLayoutState(false);
             return false;
         }
     }
@@ -1741,11 +1905,33 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
             const SplitscreenPatchSite& site = sites[installed];
             WriteMemory(site.address, site.expected, site.patch_size);
         }
+        SaveSplitscreenLayoutState(false);
         return false;
     }
 
-    g_splitscreen_vertical_layout = true;
-    Log("SplitscreenOrientation: Vertical (left/right, odd-width remainder assigned to player 2)");
+    g_splitscreen_vertical_capable = true;
+    g_splitscreen_vertical_layout = selected_vertical;
+    Log(
+        "Splitscreen layout runtime: capable=1 selected=%s",
+        g_splitscreen_vertical_layout ? "Vertical" : "Horizontal"
+    );
+    return true;
+}
+
+bool StockEventTableContains(DWORD event_id)
+{
+    auto* entry = reinterpret_cast<const SplitscreenOrientationEventDescriptor*>(0x00697590);
+    for (size_t index = 0; index < 2048; ++index, ++entry) {
+        if (!IsReadableMemory(entry, sizeof(*entry))) {
+            return true;
+        }
+        if (entry->name == nullptr) {
+            return false;
+        }
+        if (entry->id == event_id) {
+            return true;
+        }
+    }
     return true;
 }
 
@@ -1777,6 +1963,12 @@ bool PatchSplitscreenFix(const ModuleRange& range)
         return false;
     }
 
+    if (StockEventTableContains(kSplitscreenHorizontalEventId) ||
+        StockEventTableContains(kSplitscreenVerticalEventId)) {
+        Log("SplitscreenFix: private orientation event IDs collide with the stock registry; no hooks installed");
+        return false;
+    }
+
     const std::uint8_t count_expected[] = {0x89, 0x7D, 0x14, 0x89, 0x7D, 0x08};
     const std::uint8_t ready_owner_expected[] = {
         0x8B, 0x53, 0x10, 0x8B, 0xC6,
@@ -1788,6 +1980,12 @@ bool PatchSplitscreenFix(const ModuleRange& range)
     const std::uint8_t held_controller_expected[] = {0x3C, 0xFF, 0x74, 0x36, 0x55};
     const std::uint8_t post_processing_expected[] = {
         0x8B, 0x54, 0x24, 0x50, 0x8B, 0xCE, 0xFF, 0x92, 0x50, 0x01, 0x00, 0x00
+    };
+    const std::uint8_t orientation_descriptor_expected[] = {0xE8, 0x56, 0xF4, 0xFF, 0xFF};
+    const std::uint8_t orientation_post_expected[] = {
+        0x39, 0x74, 0x24, 0x08, 0x74, 0x0F,
+        0xA1, 0x14, 0x84, 0x8E, 0x00, 0x56, 0x8D, 0x54, 0x24, 0x0C,
+        0xE8, 0x2B, 0xAA, 0xFC, 0xFF
     };
     const std::uint8_t filesystem_expected[] = {0x68, 0xF8, 0x7D, 0x67, 0x00};
 
@@ -1803,6 +2001,8 @@ bool PatchSplitscreenFix(const ModuleRange& range)
         {reinterpret_cast<std::uint8_t*>(0x0055D705), pressed_controller_expected, sizeof(pressed_controller_expected), sizeof(pressed_controller_expected), reinterpret_cast<void*>(&SplitscreenPressedControllerHook55D705), "pressed-controller", false},
         {reinterpret_cast<std::uint8_t*>(0x0055D785), held_controller_expected, sizeof(held_controller_expected), sizeof(held_controller_expected), reinterpret_cast<void*>(&SplitscreenHeldControllerHook55D785), "held-controller", false},
         {reinterpret_cast<std::uint8_t*>(0x004CBB26), post_processing_expected, sizeof(post_processing_expected), sizeof(post_processing_expected), reinterpret_cast<void*>(&SplitscreenPostProcessingHook4CBB26), "post-processing-viewport", false},
+        {reinterpret_cast<std::uint8_t*>(0x0048D2F5), orientation_descriptor_expected, sizeof(orientation_descriptor_expected), sizeof(orientation_descriptor_expected), reinterpret_cast<void*>(&SplitscreenEventDescriptorHook48D2F5), "orientation-event-descriptor", true},
+        {reinterpret_cast<std::uint8_t*>(0x0048D4C0), orientation_post_expected, sizeof(orientation_post_expected), 6, reinterpret_cast<void*>(&SplitscreenPostEventHook48D4C0), "orientation-event-post", false},
         {reinterpret_cast<std::uint8_t*>(0x00520F7E), filesystem_expected, sizeof(filesystem_expected), sizeof(filesystem_expected), reinterpret_cast<void*>(&SplitscreenFilesystemHook520F7E), "filesystem-mount", false},
     };
 
@@ -2195,7 +2395,7 @@ bool PatchWidescreenFovMatrixHooks()
                 "primary-projection-aspect",
                 false
             };
-            if (g_splitscreen_vertical_layout && SplitscreenBranchMatches(shared_site)) {
+            if (g_splitscreen_vertical_capable && SplitscreenBranchMatches(shared_site)) {
                 Log("WidescreenFix_FOVScaling: retained shared vertical split-mode hook at 0x004C9E27");
             } else {
                 char actual[48] = {};
@@ -2254,7 +2454,7 @@ void ApplyPatches()
     const ModuleRange exe = GetExeRange();
     Log("FO2 ZPatch reimplementation attached: exe=0x%p size=0x%lX", exe.base, static_cast<unsigned long>(exe.size));
     Log(
-        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d SplitscreenOrientation=%s SplitscreenPostProcessingFix=%d SplitscreenZoomInputFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
+        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d SplitscreenLayoutState=%s SplitscreenPostProcessingFix=%d SplitscreenZoomInputFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
         g_log_enabled ? 1 : 0,
         g_skip_license_screen ? 1 : 0,
         g_skip_intro ? 1 : 0,
@@ -2265,7 +2465,7 @@ void ApplyPatches()
         g_widescreen_fix ? 1 : 0,
         g_widescreen_fov_scaling ? 1 : 0,
         g_splitscreen_fix ? 1 : 0,
-        g_splitscreen_vertical_layout_requested ? "Vertical" : "Horizontal",
+        g_splitscreen_vertical_layout ? "Vertical" : "Horizontal",
         g_splitscreen_post_processing_fix ? 1 : 0,
         g_splitscreen_zoom_input_fix ? 1 : 0,
         g_menu_car_backface_culling ? 1 : 0,

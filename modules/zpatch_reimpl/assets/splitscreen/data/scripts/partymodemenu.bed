@@ -17,6 +17,48 @@ local tracks
 
 local SplitScreen
 
+local SPLIT_LAYOUT_HORIZONTAL_EVENT=2130837505 -- 0x7F020001
+local SPLIT_LAYOUT_VERTICAL_EVENT=2130837506   -- 0x7F020002
+
+local function LoadSplitLayout()
+	local chunk=loadfile("fo2_splitscreen_layout.lua")
+	if chunk then
+		local ok,value=pcall(chunk)
+		if ok and type(value) == "number" then
+			if value == 0 then
+				return false
+			elseif value == 1 then
+				return true
+			end
+		end
+	end
+	return true
+end
+
+local function ApplySplitLayout(vertical)
+	if vertical then
+		Event:PostEvent(event(SPLIT_LAYOUT_VERTICAL_EVENT))
+	else
+		Event:PostEvent(event(SPLIT_LAYOUT_HORIZONTAL_EVENT))
+	end
+
+	-- The native bridge persists its authoritative active orientation before
+	-- PostEvent returns. Reload it so a signature/capability fallback to
+	-- Horizontal is reflected immediately instead of leaving a stale label.
+	local active_vertical=LoadSplitLayout()
+	if state then
+		state.split_vertical=active_vertical
+	end
+	return active_vertical
+end
+
+local function SplitLayoutLabel(vertical)
+	if vertical then
+		return L"VERTICAL (LEFT / RIGHT)"
+	end
+	return L"HORIZONTAL (TOP / BOTTOM)"
+end
+
 local function ResetSplitMenuControllers()
 	if SplitScreen then
 		GUI:ResetAllowedControllers()
@@ -93,8 +135,13 @@ menu_partymode.options.title=TRANSLATOR(TITLE_PARTYMODE)
 menu_partymode.back = function()
 	ResetSplitMenuControllers()
 	if state then
+		if state.input_player and state.input_layout_original ~= nil then
+			state.split_vertical=state.input_layout_original
+			ApplySplitLayout(state.split_vertical)
+		end
 		state.input_player=nil
 		state.input_original=nil
+		state.input_layout_original=nil
 		state.input_device_count=nil
 		state.input_armed=nil
 		state.input_entering=nil
@@ -193,6 +240,7 @@ local function select_splitscreen_event()
 		MessageBox(controller_error,MESSAGEBOX_OK,function() GUI:ShowMenuButtons() end)
 		return
 	end
+	ApplySplitLayout(state.split_vertical)
 
 	OkAction(state)
 end
@@ -298,7 +346,7 @@ local function set_buttons()
 		menu_partymode.items[3]=MENUITEM(TRANSLATOR(ICON_PARTY_GORACE),disabled(),ICON(menu_partymode,"icon_go_race_grayed"))
 	elseif state.num_players == maxplayers then
 		if SplitScreen then
-			menu_partymode.items[1]=MENUITEM(L"INPUT DEVICES",start_splitinput,ICON(menu_partymode,"icon_add_player"))
+			menu_partymode.items[1]=MENUITEM(L"INPUT / LAYOUT",start_splitinput,ICON(menu_partymode,"icon_add_player"))
 		else
 			menu_partymode.items[1]=MENUITEM(TRANSLATOR(ICON_PARTY_ADDPLAYER),disabled(),ICON(menu_partymode,"icon_add_player_grayed"))
 		end
@@ -393,13 +441,27 @@ local function SetPlayerBars()
 			W(prefix.."_left"):HideWindow()
 			W(prefix.."_right"):HideWindow()
 		end
+		local layoutbar=W("split_layout_bar")
+		layoutbar:SetAlpha(1)
+		layoutbar:AttachResource(menu_partymode:getResource("black_transparent_50"))
+		W("split_layout_label"):SetAlpha(1)
+		local layoutvalue=W("split_layout_value")
+		layoutvalue:SetAlpha(1)
+		layoutvalue:SetTitle(SplitLayoutLabel(state.split_vertical))
+		W("split_layout_left"):HideWindow()
+		W("split_layout_right"):HideWindow()
 	end
 
 end
 
 local function splitinput_setselected()
 	SetPlayerBars()
-	local prefix=string.format("player%d_input",state.input_player)
+	local prefix
+	if state.input_player == 3 then
+		prefix="split_layout"
+	else
+		prefix=string.format("player%d_input",state.input_player)
+	end
 	local w=W(prefix.."_bar")
 	w:AttachResource(menu_partymode:getResource("white_transparent"))
 	w:SetAlpha(0.3)
@@ -422,13 +484,19 @@ local function end_splitinput(commit)
 			MessageBox(controller_error,MESSAGEBOX_OK,function() W("inputhandler"):SetFocus() end)
 			return false
 		end
+		ApplySplitLayout(state.split_vertical)
 	elseif state.input_original then
 		for i=1,2 do
 			state.players[i].input_index=state.input_original[i]
 		end
+		if state.input_layout_original ~= nil then
+			state.split_vertical=state.input_layout_original
+			ApplySplitLayout(state.split_vertical)
+		end
 	end
 	state.input_player=nil
 	state.input_original=nil
+	state.input_layout_original=nil
 	state.input_device_count=nil
 	state.input_armed=nil
 	state.input_entering=nil
@@ -448,8 +516,18 @@ end
 
 local function cycle_splitinput(direction)
 	local playerindex=state.input_player
+	if not playerindex then
+		return
+	end
+	if playerindex == 3 then
+		state.split_vertical=not state.split_vertical
+		ApplySplitLayout(state.split_vertical)
+		splitinput_setselected()
+		return true
+	end
+
 	local numcontrollers=Input.GetNumControllers()
-	if not playerindex or numcontrollers < 1 then
+	if numcontrollers < 1 then
 		return
 	end
 
@@ -502,6 +580,7 @@ start_splitinput = function()
 	GUI:HideMenuButtons()
 	state.input_player=1
 	state.input_original={ state.players[1].input_index,state.players[2].input_index }
+	state.input_layout_original=state.split_vertical
 	state.input_device_count=Input.GetNumControllers()
 	-- A controller confirmation may arrive both natively and as Zoom's
 	-- synthesized Return. Arm on a later timer tick so neither copy can be
@@ -609,6 +688,10 @@ function menu_partymode.create(self)
 		state.total_players= 0
 		state.num_players= 0
 		state.players={}
+		if SplitScreen then
+			state.split_vertical=LoadSplitLayout()
+			ApplySplitLayout(state.split_vertical)
+		end
 
 		for i=1,8 do
 			local playerinfo=db.GameFlow[string.format("PlayerInfo[%d]",i-1)]
@@ -683,7 +766,7 @@ function menu_partymode.init(self)
 	end
 
 	if SplitScreen then
-		StaticText{Title=L"INPUT DEVICES",Font=fontsmall(),Position=POS(278,190),Color=GetPaletteColor(33),Align=FONTF_RIGHT}
+		StaticText{Title=L"SPLIT SETUP",Font=fontsmall(),Position=POS(278,190),Color=GetPaletteColor(33),Align=FONTF_RIGHT}
 		local inputarrowsize=GetResourceSize(self:getResource("selection_arrow_l"))
 		local inputy=205
 		for i=1,2 do
@@ -695,6 +778,11 @@ function menu_partymode.init(self)
 			Frame{Name=prefix.."_right",Position=POS(604,inputy+5),Size=inputarrowsize}:AttachResource(self:getResource("selection_arrow_l"))
 			inputy=inputy+26
 		end
+		Frame{Name="split_layout_bar",Position=POS(0,inputy),Size=SIZE(640,20)}:AttachResource(self:getResource("black_transparent_50"))
+		StaticText{Name="split_layout_label",Title=L"SPLIT LAYOUT",Position=POS(278,inputy),Font=fontsmall(),Color=GetPaletteColor(34),Align=FONTF_RIGHT}
+		Frame{Name="split_layout_left",Position=POS(298,inputy+5),Size=inputarrowsize}:AttachResource(self:getResource("selection_arrow_r"))
+		StaticText{Name="split_layout_value",Position=POS(314,inputy),Size=SIZE(286,20),Font=fontsmall(),Color=GetPaletteColor(34)}
+		Frame{Name="split_layout_right",Position=POS(604,inputy+5),Size=inputarrowsize}:AttachResource(self:getResource("selection_arrow_l"))
 	end
 
 	SetPlayerBars()
@@ -714,7 +802,7 @@ function menu_partymode.init(self)
 				end
 				playmenusound_move()
 			elseif virtualkey == KeyCodes.BUTTON_DOWN then
-				if state.input_player < state.num_players then
+				if state.input_player < state.num_players+1 then
 					state.input_player=state.input_player+1
 					splitinput_setselected()
 				end
@@ -777,9 +865,14 @@ function menu_partymode.deinit(self)
 			for i=1,2 do
 				state.players[i].input_index=state.input_original[i]
 			end
+			if state.input_layout_original ~= nil then
+				state.split_vertical=state.input_layout_original
+				ApplySplitLayout(state.split_vertical)
+			end
 		end
 		state.input_player=nil
 		state.input_original=nil
+		state.input_layout_original=nil
 		state.input_device_count=nil
 		state.input_armed=nil
 		state.input_entering=nil
