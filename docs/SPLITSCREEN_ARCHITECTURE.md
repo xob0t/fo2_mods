@@ -183,7 +183,7 @@ path during later render passes.
 | `0x004CBDEF` | widescreen projection extents | derives horizontal extent from the effective aspect at projection `+0x118` |
 | `0x004C9F63` | widescreen matrix-object extents | applies the same authoritative-aspect calculation to the matrix object |
 | `0x0059964A` | widescreen projection-stack extents | applies the same authoritative-aspect calculation to the projection stack |
-| `0x004B9BEB` | singleton race-map render call | centers the map on the full 640-unit HUD canvas only while the vertical render latch is active |
+| `0x004B9BEB` | singleton race-map render call | validates the live viewport registry and centers the map on the full 640-unit HUD canvas |
 
 The widescreen extent helpers preserve vertical FOV and use the native effective
 viewport aspect exactly once: `V=tan(FOV/2)*near*0.75`, `H=V*aspect` for the matrix
@@ -193,16 +193,20 @@ device aspect for left/right. This avoids the former global-desktop-aspect plus
 second split-mode correction.
 
 The runtime orientation patch is a separate seven-site transaction: primary aspect,
-secondary aspect, three player-2 POSITION anchors, singleton race-map call, and
-layout-builder call. It is installed
+secondary aspect, the POSITION background loop and two player-2 text anchors,
+singleton race-map call, and layout-builder call. It is installed
 even when horizontal is selected so the UI can switch immediately. A missing,
 changed, or partially writable site leaves the core split feature installed but
 falls back to horizontal. The race-map hook changes only X for map type 1; the one
 shared 128-unit map is placed at X=256 on the 640-unit HUD canvas and intentionally
 spans the center divider. Horizontal, single-player, and derby maps retain stock
 placement.
-In vertical mode the POSITION background, title, and value all take their normal
-per-viewport top anchor; only horizontal player 2 retains the stock bottom override.
+The two translucent POSITION background bars are skipped for a live vertical HUD
+pass, while the title and value take their normal per-viewport top anchor. Horizontal
+player 2 retains the complete stock background and bottom-anchor behavior. Visual
+state is derived from the live registry rectangles rather than the orientation
+selection lifecycle, so switching the menu cannot leave the minimap or HUD on a
+stale latch.
 
 Four-player projection should use the native count-4 path initially. A 2x2 quadrant
 retains the full device aspect ratio, so it does not need the count-2 scalar used by
@@ -369,15 +373,16 @@ quadrants; that remains a visual acceptance test.
 | ---: | --- | --- |
 | `0x004C9E27` | `8B C3 83 E8 02 75 02 DC C0` | `ProjectionSplitModeHook` |
 | `0x004CBD5D` | `8B C6 83 E8 02 75 02 DC C0` | `ProjectionSplitModeSecondaryHook4CBD5D` |
-| `0x004B8D49` | split player-2 background bottom-anchor branch | `SplitscreenHudBackgroundHook4B8D49` |
+| `0x004B8CA0` | first `mov eax,[esp+0x4C8]` in the two-entry POSITION background loop | `SplitscreenHudBackgroundHook4B8CA0` |
 | `0x004B9F43` | split player-2 POSITION-title bottom-anchor branch | `SplitscreenPositionTitleHook4B9F43` |
 | `0x004BA08F` | split player-2 POSITION-value bottom-anchor branch | `SplitscreenPositionValueHook4BA08F` |
 | `0x004B9BEB` | `E8 F0 BE 00 00`, singleton map-render call | `SplitscreenRaceMapHook4B9BEB` |
 | `0x0045CF1B` | `E8 00 39 01 00`, call to native viewport builder | `SplitscreenViewportLayoutCall45CF1B` |
 
 The vertical transaction additionally validates the surrounding caller bytes at
-`0x0045CF11..0x0045CF25`. Both transactions verify the installed branch target and
-NOP padding, not just whether the write API returned success.
+`0x0045CF11..0x0045CF25` and the instruction following the background-loop detour at
+`0x004B8CA7`. Both transactions verify the installed branch target and NOP padding,
+not just whether the write API returned success.
 
 The UI/native bridge adds one getter and two no-argument orientation setters to the
 stock `Input` table at the existing registration hook. The setters persist first,
