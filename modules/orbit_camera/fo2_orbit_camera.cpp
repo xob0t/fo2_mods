@@ -17,7 +17,7 @@ constexpr uintptr_t kCameraUpdateSlot = 0x00673FFC;
 constexpr uintptr_t kCameraControllerVtable = 0x006742EC;
 constexpr uintptr_t kPosition2Vtable = 0x0067415C;
 constexpr uintptr_t kTarget2Vtable = 0x00674040;
-constexpr uintptr_t kTracker2Vtable = 0x00674130;
+constexpr uintptr_t kZoomType1Vtable = 0x00674204;
 constexpr uintptr_t kNativePadVtable = 0x0067B920;
 constexpr uintptr_t kCameraContextGlobal = 0x008E8424;
 constexpr uintptr_t kInputManagerGlobal = 0x008E844C;
@@ -41,9 +41,9 @@ struct Config {
     float deadzone_enter = 0.20f;
     float deadzone_exit = 0.15f;
     float curve = 1.0f;
-    float engage_time = 0.12f;
-    float return_time = 0.20f;
-    float max_speed = 900.0f * kPi / 180.0f;
+    float engage_time = 0.04f;
+    float return_time = 0.07f;
+    float max_speed = 2400.0f * kPi / 180.0f;
     bool invert_x = false;
     bool invert_y = false;
     int zoom_axis_x = 2;
@@ -160,9 +160,9 @@ void LoadConfig(bool first)
     next.deadzone_enter = ClampFloat(ReadFloat("DeadzoneEnter", 0.20f), 0.01f, 0.95f);
     next.deadzone_exit = ClampFloat(ReadFloat("DeadzoneExit", 0.15f), 0.0f, next.deadzone_enter);
     next.curve = ClampFloat(ReadFloat("AxisCurveExponent", 1.0f), 0.25f, 4.0f);
-    next.engage_time = ClampFloat(ReadFloat("EngageSmoothTime", 0.12f), 0.001f, 2.0f);
-    next.return_time = ClampFloat(ReadFloat("ReturnSmoothTime", 0.20f), 0.001f, 2.0f);
-    next.max_speed = ClampFloat(ReadFloat("MaxYawSpeedDeg", 900.0f), 1.0f, 5000.0f) * kPi / 180.0f;
+    next.engage_time = ClampFloat(ReadFloat("EngageSmoothTime", 0.04f), 0.001f, 2.0f);
+    next.return_time = ClampFloat(ReadFloat("ReturnSmoothTime", 0.07f), 0.001f, 2.0f);
+    next.max_speed = ClampFloat(ReadFloat("MaxYawSpeedDeg", 2400.0f), 1.0f, 5000.0f) * kPi / 180.0f;
     next.invert_x = GetPrivateProfileIntA("orbit_camera", "InvertX", 0, g_ini_path) != 0;
     next.invert_y = GetPrivateProfileIntA("orbit_camera", "InvertY", 0, g_ini_path) != 0;
     next.zoom_axis_x = std::max(0, std::min(8, static_cast<int>(GetPrivateProfileIntA("orbit_camera", "ZoomAxisX", 2, g_ini_path))));
@@ -420,6 +420,13 @@ float UnwrapNear(float target, float current)
     return target;
 }
 
+float StickTargetYaw(float x, float y)
+{
+    // Pulling the stick back looks behind. Pushing it forward returns to the
+    // normal chase direction; horizontal directions remain fixed side views.
+    return std::atan2(x, -y);
+}
+
 float SmoothDamp(float current, float target, float& velocity, float smooth_time, float max_speed, float dt)
 {
     const float omega = 2.0f / std::max(0.001f, smooth_time);
@@ -504,11 +511,11 @@ void __fastcall CameraUpdateHook(void* active_ptr, void*, float dt)
     }
     auto* position = *reinterpret_cast<std::uint8_t**>(active + 0x0C);
     auto* target_component = *reinterpret_cast<std::uint8_t**>(active + 0x10);
-    auto* tracker = *reinterpret_cast<std::uint8_t**>(active + 0x14);
+    auto* zoom = *reinterpret_cast<std::uint8_t**>(active + 0x14);
     if (!IsMemory(position, sizeof(uintptr_t)) || !IsMemory(target_component, sizeof(uintptr_t)) ||
-        !IsMemory(tracker, sizeof(uintptr_t)) || *reinterpret_cast<uintptr_t*>(position) != kPosition2Vtable ||
+        !IsMemory(zoom, sizeof(uintptr_t)) || *reinterpret_cast<uintptr_t*>(position) != kPosition2Vtable ||
         *reinterpret_cast<uintptr_t*>(target_component) != kTarget2Vtable ||
-        *reinterpret_cast<uintptr_t*>(tracker) != kTracker2Vtable) {
+        *reinterpret_cast<uintptr_t*>(zoom) != kZoomType1Vtable) {
         ResetState(controller);
         call_original(); return;
     }
@@ -542,7 +549,7 @@ void __fastcall CameraUpdateHook(void* active_ptr, void*, float dt)
     }
     if (state.stick_active) { if (magnitude <= g_config.deadzone_exit) state.stick_active = false; }
     else if (magnitude >= g_config.deadzone_enter) state.stick_active = true;
-    float target = state.stick_active ? std::atan2(x, y) : 0.0f;
+    float target = state.stick_active ? StickTargetYaw(x, y) : 0.0f;
     target = UnwrapNear(target, state.yaw);
     const float step = ClampFloat(Finite(dt) ? dt : 0.0f, 0.0f, 1.0f / 15.0f);
     state.yaw = SmoothDamp(state.yaw, target, state.velocity,
@@ -564,10 +571,11 @@ bool RunSelfTests()
     RotateMatrix(matrix, rotated, kPi * 0.5f);
     if (std::fabs(rotated[0]) > 0.001f || std::fabs(rotated[2] + 1.0f) > 0.001f ||
         std::fabs(rotated[8] - 1.0f) > 0.001f || std::fabs(rotated[5] - 1.0f) > 0.001f) return false;
-    if (std::fabs(std::atan2(1.0f, 0.0f) - kPi * 0.5f) > 0.001f ||
-        std::fabs(std::fabs(std::atan2(0.0f, -1.0f)) - kPi) > 0.001f) return false;
+    if (std::fabs(StickTargetYaw(1.0f, 0.0f) - kPi * 0.5f) > 0.001f ||
+        std::fabs(std::fabs(StickTargetYaw(0.0f, 1.0f)) - kPi) > 0.001f ||
+        std::fabs(StickTargetYaw(0.0f, -1.0f)) > 0.001f) return false;
     float velocity = 0.0f;
-    const float value = SmoothDamp(0.0f, kPi, velocity, 0.12f, 900.0f * kPi / 180.0f, 1.0f / 60.0f);
+    const float value = SmoothDamp(0.0f, kPi, velocity, 0.04f, 2400.0f * kPi / 180.0f, 1.0f / 60.0f);
     return Finite(value) && value > 0.0f && value < kPi && Finite(velocity);
 }
 
@@ -630,7 +638,7 @@ int main()
     if (!RunSelfTests()) return 1;
     if (std::fabs(NormalizeAxis(10000, 0.0f, 10000.0f) - 1.0f) > 0.0001f) return 2;
     if (std::fabs(NormalizeAxis(-10000, 0.0f, 10000.0f) + 1.0f) > 0.0001f) return 3;
-    if (std::fabs(std::atan2(-1.0f, 0.0f) + kPi * 0.5f) > 0.0001f) return 4;
+    if (std::fabs(StickTargetYaw(-1.0f, 0.0f) + kPi * 0.5f) > 0.0001f) return 4;
     return 0;
 }
 #else

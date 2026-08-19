@@ -16,13 +16,13 @@ The repository's top-level build and install scripts package and install all thr
 
 The right stick selects an absolute camera angle rather than accumulating rotation:
 
-- idle or down: native rear chase direction (`0` degrees)
+- idle or up: native rear chase direction (`0` degrees)
 - right: right-side view (`+90` degrees)
-- up: look-back view (`180` degrees)
+- down (pull back): look-back view (`180` degrees)
 - left: left-side view (`-90` degrees)
 - diagonals: intermediate angles
 
-The plugin keeps independent orbit state for each controller and resets state when camera ownership, device assignment, configuration, or chase-camera eligibility changes.
+The plugin keeps independent orbit state for each controller and resets state when camera ownership, device assignment, configuration, or chase-camera eligibility changes. Direction changes snap quickly to their absolute view with a short easing tail; holding left or right never keeps rotating the camera.
 
 Right-stick input is capability-gated. Automatic input prefers the assigned SDL gamepad with the verified Zoom Platform build, falls back to the game's validated native DirectInput state for stock pads, and uses the split-screen adapter's validated state for player four. Unknown devices or invalid state leave the native camera unchanged.
 
