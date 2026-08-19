@@ -266,12 +266,12 @@ menu_multiplayer.back=entermenu("menu_mainmenu")
 
 local function StartSplitscreen(race, players)
 	local maxplayers=Input.GetSplitscreenMaxPlayers()
-	if type(maxplayers) ~= "number" or maxplayers ~= math.floor(maxplayers) or maxplayers < 2 or maxplayers > 3 then
+	if type(maxplayers) ~= "number" or maxplayers ~= math.floor(maxplayers) or maxplayers < 2 or maxplayers > 4 then
 		maxplayers=2
 	end
 	if players.num_players < 2 or players.num_players > maxplayers then
 		local message=L"SPLIT SCREEN REQUIRES EXACTLY TWO PLAYERS."
-		if maxplayers == 3 then message=L"SPLIT SCREEN REQUIRES TWO OR THREE PLAYERS." end
+		if maxplayers >= 3 then message=L(string.format("SPLIT SCREEN REQUIRES BETWEEN TWO AND %d PLAYERS.",maxplayers)) end
 		MessageBox(message,MESSAGEBOX_OK,function() EnterMenu("menu_partymode") end)
 		return
 	end

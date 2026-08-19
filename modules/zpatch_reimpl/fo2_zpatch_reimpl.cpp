@@ -1,7 +1,10 @@
 #define WIN32_LEAN_AND_MEAN
+#define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
 #include <d3d9.h>
+#include <dinput.h>
 #include <mmsystem.h>
+#include <xinput.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -28,6 +31,7 @@ bool g_splitscreen_zoom_input_fix = true;
 bool g_splitscreen_vertical_layout = false;
 bool g_splitscreen_vertical_capable = false;
 bool g_splitscreen_three_player_capable = false;
+bool g_splitscreen_four_player_capable = false;
 bool g_splitscreen_vertical_render_active = false;
 bool g_splitscreen_vertical_hud_pass_active = false;
 bool g_splitscreen_grid_hud_pass_active = false;
@@ -38,6 +42,41 @@ char g_log_path[MAX_PATH] = {};
 char g_splitscreen_layout_state_path[MAX_PATH] = {};
 char g_splitscreen_filesystem_name[] = "fo2_splitscreen_filesystem";
 HMODULE g_winmm = nullptr;
+
+using XInputGetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+HMODULE g_xinput_module = nullptr;
+XInputGetStateFn g_xinput_get_state = nullptr;
+
+struct FourPlayerInputSidecar {
+    std::uint8_t* manager;
+    std::uint8_t* native_backend;
+    std::uint8_t* adapter;
+    std::uint8_t* shadow_backend;
+};
+
+FourPlayerInputSidecar g_four_player_input = {};
+std::uint8_t* g_four_player_manager_for_hooks = nullptr;
+std::uint8_t* g_four_player_native_backend_for_hooks = nullptr;
+std::uint8_t* g_four_player_adapter_for_hooks = nullptr;
+std::uintptr_t g_four_player_pad_vtable[54] = {};
+DWORD g_four_player_connection_sentinel = 1;
+std::uint8_t g_saved_controller_guid[16] = {};
+bool g_saved_controller_guid_valid = false;
+
+constexpr size_t kInputManagerDeviceCountOffset = 0x04;
+constexpr size_t kInputManagerDeviceArrayOffset = 0x1C;
+constexpr size_t kInputManagerBackendOrSlot3Offset = 0x28;
+constexpr size_t kNativePadObjectSize = 0x8EC;
+constexpr size_t kNativeControllerBackendSize = 0x5098;
+constexpr size_t kNativePadVtableEntries = 54;
+constexpr DWORD kThirdPadXInputUser = 2;
+
+const GUID kFourPlayerAdapterGuid = {
+    0x464F3258, 0x3450, 0x4144, {0x58, 0x49, 0x4E, 0x50, 0x55, 0x54, 0x33, 0x00}
+};
+
+static_assert(sizeof(DIJOYSTATE2) == 0x110, "FO2 backend requires DIJOYSTATE2-sized snapshots");
+static_assert(offsetof(DIJOYSTATE2, rgbButtons) == 0x30, "FO2 button bindings assume DIJOYSTATE2 button offset");
 
 using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
 Direct3DCreate9Fn g_real_direct3d_create9 = nullptr;
@@ -361,6 +400,506 @@ bool WriteCall(void* address, void* destination, size_t size)
     return WriteMemory(address, patch, size);
 }
 
+LONG ScaleXInputAxis(SHORT value)
+{
+    const LONG scaled = value >= 0
+        ? static_cast<LONG>(value) * 10000 / 32767
+        : static_cast<LONG>(value) * 10000 / 32768;
+    return std::max<LONG>(-10000, std::min<LONG>(10000, scaled));
+}
+
+DWORD XInputPov(WORD buttons)
+{
+    const bool up = (buttons & XINPUT_GAMEPAD_DPAD_UP) != 0;
+    const bool down = (buttons & XINPUT_GAMEPAD_DPAD_DOWN) != 0;
+    const bool left = (buttons & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+    const bool right = (buttons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+    if (up && right && !down && !left) return 4500;
+    if (down && right && !up && !left) return 13500;
+    if (down && left && !up && !right) return 22500;
+    if (up && left && !down && !right) return 31500;
+    if (up && !down) return 0;
+    if (right && !left) return 9000;
+    if (down && !up) return 18000;
+    if (left && !right) return 27000;
+    return 0xFFFFFFFF;
+}
+
+void TranslateXInputState(const XINPUT_GAMEPAD& source, DIJOYSTATE2* destination)
+{
+    if (destination == nullptr) {
+        return;
+    }
+    std::memset(destination, 0, sizeof(*destination));
+    destination->lX = ScaleXInputAxis(source.sThumbLX);
+    destination->lY = -ScaleXInputAxis(source.sThumbLY);
+    destination->lRx = ScaleXInputAxis(source.sThumbRX);
+    destination->lRy = -ScaleXInputAxis(source.sThumbRY);
+    destination->lZ =
+        (static_cast<LONG>(source.bRightTrigger) - static_cast<LONG>(source.bLeftTrigger)) * 10000 / 255;
+    destination->rgdwPOV[0] = XInputPov(source.wButtons);
+    destination->rgdwPOV[1] = 0xFFFFFFFF;
+    destination->rgdwPOV[2] = 0xFFFFFFFF;
+    destination->rgdwPOV[3] = 0xFFFFFFFF;
+
+    const WORD masks[10] = {
+        XINPUT_GAMEPAD_A,
+        XINPUT_GAMEPAD_B,
+        XINPUT_GAMEPAD_X,
+        XINPUT_GAMEPAD_Y,
+        XINPUT_GAMEPAD_LEFT_SHOULDER,
+        XINPUT_GAMEPAD_RIGHT_SHOULDER,
+        XINPUT_GAMEPAD_BACK,
+        XINPUT_GAMEPAD_START,
+        XINPUT_GAMEPAD_LEFT_THUMB,
+        XINPUT_GAMEPAD_RIGHT_THUMB,
+    };
+    for (size_t i = 0; i < sizeof(masks) / sizeof(masks[0]); ++i) {
+        destination->rgbButtons[i] = (source.wButtons & masks[i]) != 0 ? 0x80 : 0;
+    }
+}
+
+bool TestFourPlayerInputTranslator()
+{
+    XINPUT_GAMEPAD source = {};
+    DIJOYSTATE2 translated = {};
+    TranslateXInputState(source, &translated);
+    if (translated.lX != 0 || translated.lY != 0 || translated.lRx != 0 ||
+        translated.lRy != 0 || translated.lZ != 0 || translated.rgdwPOV[0] != 0xFFFFFFFF) {
+        return false;
+    }
+
+    const WORD masks[10] = {
+        XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+        XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_START,
+        XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB,
+    };
+    for (size_t i = 0; i < sizeof(masks) / sizeof(masks[0]); ++i) {
+        source = {};
+        source.wButtons = masks[i];
+        TranslateXInputState(source, &translated);
+        if (translated.rgbButtons[i] != 0x80) {
+            return false;
+        }
+    }
+
+    const WORD pov_masks[8] = {
+        XINPUT_GAMEPAD_DPAD_UP,
+        XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT,
+        XINPUT_GAMEPAD_DPAD_RIGHT,
+        XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_DPAD_DOWN,
+        XINPUT_GAMEPAD_DPAD_DOWN,
+        XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT,
+        XINPUT_GAMEPAD_DPAD_LEFT,
+        XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_UP,
+    };
+    const DWORD pov_values[8] = {0, 4500, 9000, 13500, 18000, 22500, 27000, 31500};
+    for (size_t i = 0; i < 8; ++i) {
+        source = {};
+        source.wButtons = pov_masks[i];
+        TranslateXInputState(source, &translated);
+        if (translated.rgdwPOV[0] != pov_values[i]) {
+            return false;
+        }
+    }
+
+    source = {};
+    source.sThumbLX = 32767;
+    source.sThumbLY = -32768;
+    source.sThumbRX = -32768;
+    source.sThumbRY = 32767;
+    source.bRightTrigger = 255;
+    TranslateXInputState(source, &translated);
+    if (translated.lX != 10000 || translated.lY != 10000 || translated.lRx != -10000 ||
+        translated.lRy != -10000 || translated.lZ != 10000) {
+        return false;
+    }
+    source.bRightTrigger = 0;
+    source.bLeftTrigger = 255;
+    TranslateXInputState(source, &translated);
+    return translated.lZ == -10000;
+}
+
+bool LoadThirdPadXInput()
+{
+    if (g_xinput_get_state != nullptr) {
+        return true;
+    }
+    const char* candidates[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
+    for (const char* name : candidates) {
+        HMODULE module = LoadLibraryA(name);
+        if (module == nullptr) {
+            continue;
+        }
+        const auto get_state = reinterpret_cast<XInputGetStateFn>(GetProcAddress(module, "XInputGetState"));
+        if (get_state != nullptr) {
+            g_xinput_module = module;
+            g_xinput_get_state = get_state;
+            return true;
+        }
+        FreeLibrary(module);
+    }
+    return false;
+}
+
+int CallNativePadPoll(std::uint8_t* object)
+{
+    int result = 0;
+    __asm {
+        mov ecx, object
+        mov eax, 0x0055D480
+        call eax
+        mov result, eax
+    }
+    return result;
+}
+
+void CallNativeInputDeviceBaseConstructor(std::uint8_t* object)
+{
+    __asm {
+        mov eax, object
+        mov ecx, 0x0055B1C0
+        call ecx
+    }
+}
+
+int CallNativePadIdentityInitializer(std::uint8_t* object, DWORD ordinal)
+{
+    int result = 0;
+    __asm {
+        mov ecx, object
+        push ordinal
+        mov eax, 0x0055D1B0
+        call eax
+        mov result, eax
+    }
+    return result;
+}
+
+char* BuildNativeControllerGuidText(const void* guid)
+{
+    char* result = nullptr;
+    __asm {
+        mov ecx, guid
+        mov eax, 0x00550420
+        call eax
+        mov result, eax
+    }
+    return result;
+}
+
+int __fastcall FourPlayerAdapterPoll(std::uint8_t* object, void*)
+{
+    if (object == nullptr || object != g_four_player_input.adapter ||
+        g_four_player_input.shadow_backend == nullptr || g_xinput_get_state == nullptr) {
+        return 0;
+    }
+
+    auto* shadow = g_four_player_input.shadow_backend;
+    auto* current = reinterpret_cast<DIJOYSTATE2*>(shadow + 0x2224);
+    auto* previous = reinterpret_cast<DIJOYSTATE2*>(shadow + 0x4684);
+    auto* analog = reinterpret_cast<DIJOYSTATE2*>(shadow);
+    XINPUT_STATE state = {};
+    if (g_xinput_get_state(kThirdPadXInputUser, &state) != ERROR_SUCCESS) {
+        std::memset(current, 0, sizeof(*current));
+        std::memset(previous, 0, sizeof(*previous));
+        std::memset(analog, 0, sizeof(*analog));
+        std::memset(object + 0x8C0, 0, 0x28);
+        object[0x130] = 0;
+        return 0;
+    }
+
+    std::memcpy(previous, current, sizeof(*previous));
+    TranslateXInputState(state.Gamepad, current);
+    std::memcpy(analog, current, sizeof(*analog));
+    *reinterpret_cast<void**>(shadow + 0x4674) = &g_four_player_connection_sentinel;
+    const int result = CallNativePadPoll(object);
+    *reinterpret_cast<void**>(shadow + 0x4674) = nullptr;
+    return result;
+}
+
+int __fastcall FourPlayerAdapterDefaultMap(std::uint8_t* object, void*)
+{
+    if (object == nullptr || g_four_player_input.shadow_backend == nullptr) {
+        return 0;
+    }
+    void* borrowed_device = nullptr;
+    if (g_four_player_input.native_backend != nullptr &&
+        IsReadableMemory(g_four_player_input.native_backend + 0x4674, sizeof(void*))) {
+        borrowed_device = *reinterpret_cast<void**>(g_four_player_input.native_backend + 0x4674);
+    }
+    *reinterpret_cast<void**>(g_four_player_input.shadow_backend + 0x4674) = borrowed_device;
+    int result = 0;
+    __asm {
+        mov ecx, object
+        mov eax, 0x0055E190
+        call eax
+        mov result, eax
+    }
+    *reinterpret_cast<void**>(g_four_player_input.shadow_backend + 0x4674) = nullptr;
+    return result;
+}
+
+void __fastcall FourPlayerAdapterDetach(std::uint8_t* object, void*)
+{
+    if (object == nullptr) {
+        return;
+    }
+    *reinterpret_cast<DWORD*>(object + 0x12C) = 0;
+    object[0x130] = 0;
+}
+
+void* __fastcall FourPlayerAdapterDeletingDestructor(std::uint8_t* object, void*, DWORD flags)
+{
+    if (object == nullptr) {
+        return nullptr;
+    }
+    std::uint8_t* shadow = *reinterpret_cast<std::uint8_t**>(object + 0x7A0);
+    *reinterpret_cast<std::uint8_t**>(object + 0x7A0) = nullptr;
+    if (shadow != nullptr) {
+        HeapFree(GetProcessHeap(), 0, shadow);
+    }
+    if (g_four_player_input.adapter == object) {
+        g_four_player_input.adapter = nullptr;
+        g_four_player_input.shadow_backend = nullptr;
+        g_four_player_adapter_for_hooks = nullptr;
+        g_splitscreen_four_player_capable = false;
+    }
+    if ((flags & 1) != 0) {
+        HeapFree(GetProcessHeap(), 0, object);
+    }
+    return object;
+}
+
+void SnapshotSelectedControllerGuid()
+{
+    if (IsReadableMemory(reinterpret_cast<void*>(0x008D7BB0), sizeof(g_saved_controller_guid))) {
+        std::memcpy(g_saved_controller_guid, reinterpret_cast<void*>(0x008D7BB0), sizeof(g_saved_controller_guid));
+        g_saved_controller_guid_valid = true;
+    } else {
+        g_saved_controller_guid_valid = false;
+    }
+}
+
+bool ValidatePublishedFourPlayerAdapter(std::uint8_t* manager)
+{
+    if (!IsReadableMemory(manager, 0x2C) || *reinterpret_cast<DWORD*>(manager + 0x04) != 4) {
+        return false;
+    }
+    void* slots[4] = {};
+    for (DWORD i = 0; i < 4; ++i) {
+        slots[i] = *reinterpret_cast<void**>(manager + kInputManagerDeviceArrayOffset + i * sizeof(void*));
+        if (!IsReadableMemory(slots[i], sizeof(void*)) ||
+            !IsReadableMemory(*reinterpret_cast<void**>(slots[i]), kNativePadVtableEntries * sizeof(void*))) {
+            return false;
+        }
+        for (DWORD j = 0; j < i; ++j) {
+            if (slots[i] == slots[j]) {
+                return false;
+            }
+        }
+    }
+    return slots[3] == g_four_player_input.adapter &&
+        g_four_player_input.native_backend != nullptr &&
+        g_four_player_input.native_backend != slots[3] &&
+        *reinterpret_cast<DWORD*>(static_cast<std::uint8_t*>(slots[3]) + 0x140) == 3;
+}
+
+void RestoreSelectedAdapterGuidIfNeeded()
+{
+    if (!g_saved_controller_guid_valid ||
+        std::memcmp(g_saved_controller_guid, &kFourPlayerAdapterGuid, sizeof(g_saved_controller_guid)) != 0) {
+        return;
+    }
+    std::memcpy(reinterpret_cast<void*>(0x008D7BB0), g_saved_controller_guid, sizeof(g_saved_controller_guid));
+    *reinterpret_cast<DWORD*>(0x008D7BE4) = 3;
+    char* text = BuildNativeControllerGuidText(reinterpret_cast<void*>(0x008D7BB0));
+    if (text != nullptr) {
+        std::strcpy(reinterpret_cast<char*>(0x008D7BC0), text);
+    }
+}
+
+void InstallFourPlayerAdapterAfterNativeConstructor(std::uint8_t* manager)
+{
+    g_splitscreen_four_player_capable = false;
+    if (!IsReadableMemory(manager, 0x2C)) {
+        Log("Splitscreen4P: manager unavailable after native construction; maximum remains 3");
+        return;
+    }
+
+    auto* native_backend = *reinterpret_cast<std::uint8_t**>(manager + kInputManagerBackendOrSlot3Offset);
+    g_four_player_input.manager = manager;
+    g_four_player_input.native_backend = native_backend;
+    g_four_player_input.adapter = nullptr;
+    g_four_player_input.shadow_backend = nullptr;
+    g_four_player_manager_for_hooks = manager;
+    g_four_player_native_backend_for_hooks = native_backend;
+    g_four_player_adapter_for_hooks = nullptr;
+
+    const DWORD native_count = *reinterpret_cast<DWORD*>(manager + kInputManagerDeviceCountOffset);
+    auto* pad0 = *reinterpret_cast<std::uint8_t**>(manager + 0x20);
+    if (native_count != 3 || native_backend == nullptr || pad0 == nullptr ||
+        *reinterpret_cast<void**>(manager + 0x1C) == nullptr ||
+        *reinterpret_cast<void**>(manager + 0x24) == nullptr ||
+        !IsReadableMemory(native_backend, kNativeControllerBackendSize) ||
+        !IsReadableMemory(pad0, kNativePadObjectSize)) {
+        Log("Splitscreen4P: stock keyboard+two-pad topology unavailable; maximum remains 3 count=%lu", static_cast<unsigned long>(native_count));
+        return;
+    }
+    if (!LoadThirdPadXInput() || !TestFourPlayerInputTranslator()) {
+        Log("Splitscreen4P: XInput loader or translator self-test failed; maximum remains 3");
+        return;
+    }
+    XINPUT_STATE state = {};
+    if (g_xinput_get_state(kThirdPadXInputUser, &state) != ERROR_SUCCESS) {
+        Log("Splitscreen4P: XInput user 2 is not connected at startup; maximum remains 3");
+        return;
+    }
+
+    auto* object = static_cast<std::uint8_t*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, kNativePadObjectSize));
+    auto* shadow = static_cast<std::uint8_t*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, kNativeControllerBackendSize));
+    if (object == nullptr || shadow == nullptr) {
+        if (shadow != nullptr) HeapFree(GetProcessHeap(), 0, shadow);
+        if (object != nullptr) HeapFree(GetProcessHeap(), 0, object);
+        Log("Splitscreen4P: adapter allocation failed; maximum remains 3");
+        return;
+    }
+
+    std::strcpy(reinterpret_cast<char*>(shadow + 0x4444), "XInput Controller 3");
+    std::memcpy(shadow + 0x464C, &kFourPlayerAdapterGuid, sizeof(kFourPlayerAdapterGuid));
+    shadow[0x466C] = native_backend[0x466C];
+    shadow[0x466E] = native_backend[0x466E];
+    shadow[0x4670] = native_backend[0x4670];
+    CallNativeInputDeviceBaseConstructor(object);
+    std::memcpy(g_four_player_pad_vtable, reinterpret_cast<void*>(0x0067B920), sizeof(g_four_player_pad_vtable));
+    g_four_player_pad_vtable[0] = reinterpret_cast<std::uintptr_t>(&FourPlayerAdapterDeletingDestructor);
+    g_four_player_pad_vtable[0x14 / sizeof(void*)] = reinterpret_cast<std::uintptr_t>(&FourPlayerAdapterPoll);
+    g_four_player_pad_vtable[0x5C / sizeof(void*)] = reinterpret_cast<std::uintptr_t>(&FourPlayerAdapterDefaultMap);
+    g_four_player_pad_vtable[0xD4 / sizeof(void*)] = reinterpret_cast<std::uintptr_t>(&FourPlayerAdapterDetach);
+    *reinterpret_cast<void***>(object) = reinterpret_cast<void**>(g_four_player_pad_vtable);
+    *reinterpret_cast<std::uint8_t**>(object + 0x7A0) = shadow;
+    *reinterpret_cast<DWORD*>(object + 0x7A4) = 0;
+    *reinterpret_cast<DWORD*>(object + 0x04) = *reinterpret_cast<DWORD*>(pad0 + 0x04);
+    *reinterpret_cast<DWORD*>(object + 0x124) = 0;
+    *reinterpret_cast<DWORD*>(object + 0x8BC) = 0;
+    *reinterpret_cast<DWORD*>(object + 0x8E8) = 0;
+    // The custom default-map entry used by D0 resolves the shadow through the
+    // sidecar, but the manager slot and public capability are not published yet.
+    g_four_player_input.adapter = object;
+    g_four_player_input.shadow_backend = shadow;
+    const int identity_result = CallNativePadIdentityInitializer(object, 3);
+    if (identity_result != 1) {
+        g_four_player_input.adapter = nullptr;
+        g_four_player_input.shadow_backend = nullptr;
+        HeapFree(GetProcessHeap(), 0, shadow);
+        HeapFree(GetProcessHeap(), 0, object);
+        Log("Splitscreen4P: native pad identity initialization failed result=%d; maximum remains 3", identity_result);
+        return;
+    }
+
+    g_four_player_adapter_for_hooks = object;
+    *reinterpret_cast<std::uint8_t**>(manager + kInputManagerBackendOrSlot3Offset) = object;
+    *reinterpret_cast<DWORD*>(manager + kInputManagerDeviceCountOffset) = 4;
+    g_splitscreen_four_player_capable = ValidatePublishedFourPlayerAdapter(manager);
+    if (!g_splitscreen_four_player_capable) {
+        *reinterpret_cast<DWORD*>(manager + kInputManagerDeviceCountOffset) = 3;
+        *reinterpret_cast<std::uint8_t**>(manager + kInputManagerBackendOrSlot3Offset) = native_backend;
+        FourPlayerAdapterDeletingDestructor(object, nullptr, 1);
+        Log("Splitscreen4P: post-install invariants failed; adapter removed and maximum remains 3");
+        return;
+    }
+
+    RestoreSelectedAdapterGuidIfNeeded();
+    Log("Splitscreen4P: installed keyboard+three-pad topology count=4 slot3=%p backend=%p name='%s' xinput_user=2",
+        object, native_backend, object + 0x18);
+}
+
+void ClearFourPlayerSidecarForManager(std::uint8_t* manager)
+{
+    if (g_four_player_input.manager != manager) {
+        return;
+    }
+    g_four_player_input = {};
+    g_four_player_manager_for_hooks = nullptr;
+    g_four_player_native_backend_for_hooks = nullptr;
+    g_four_player_adapter_for_hooks = nullptr;
+    g_splitscreen_four_player_capable = false;
+}
+
+__declspec(naked) void SplitscreenFourPlayerConstructorCall521134()
+{
+    __asm {
+        push ebp
+        mov ebp, esp
+        pushfd
+        pushad
+        call SnapshotSelectedControllerGuid
+        popad
+        popfd
+        push dword ptr [ebp + 8]
+        mov eax, 0x0054FF10
+        call eax
+        pushfd
+        pushad
+        push dword ptr [ebp + 8]
+        call InstallFourPlayerAdapterAfterNativeConstructor
+        add esp, 4
+        popad
+        popfd
+        pop ebp
+        ret 4
+    }
+}
+
+__declspec(naked) void SplitscreenFourPlayerBackendUpdate55B490()
+{
+    __asm {
+        pushfd
+        cmp eax, dword ptr [g_four_player_adapter_for_hooks]
+        jne stock
+        mov eax, dword ptr [g_four_player_native_backend_for_hooks]
+    stock:
+        popfd
+        push ebx
+        push esi
+        push edi
+        mov edi, eax
+        push 0x0055B495
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenFourPlayerBackendShutdown55011D()
+{
+    __asm {
+        mov esi, dword ptr [g_four_player_native_backend_for_hooks]
+        cmp edi, dword ptr [g_four_player_manager_for_hooks]
+        je selected
+        mov esi, dword ptr [edi + 0x28]
+    selected:
+        test esi, esi
+        push 0x00550122
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenFourPlayerBackendClear550175()
+{
+    __asm {
+        pushfd
+        pushad
+        push edi
+        call ClearFourPlayerSidecarForManager
+        add esp, 4
+        popad
+        popfd
+        mov dword ptr [edi + 0x28], 0
+        push 0x0055017C
+        ret
+    }
+}
+
 bool WriteFloatOperand(std::uintptr_t address, const float* value);
 
 __declspec(naked) void FovContextProjectionCallHook()
@@ -670,7 +1209,8 @@ int __cdecl LuaGetSplitscreenMaxPlayers(void* lua_state)
     using LuaPushIntegerFn = void (__cdecl*)(void*, int);
     reinterpret_cast<LuaPushIntegerFn>(0x005B46E0)(
         lua_state,
-        g_splitscreen_three_player_capable ? 3 : 2
+        g_splitscreen_four_player_capable ? 4 :
+            (g_splitscreen_three_player_capable ? 3 : 2)
     );
     return 1;
 }
@@ -758,12 +1298,19 @@ bool IsLiveVerticalSplitscreenVisualState()
         *reinterpret_cast<DWORD*>(right + 0x0C) == device_height;
 }
 
-bool IsLiveThreePlayerGridState()
+bool IsLiveGridSplitscreenState()
 {
     auto* registry = *reinterpret_cast<std::uint8_t**>(0x00696DC8);
     auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
-    if (!IsReadableMemory(registry, 0x7C) || !IsReadableMemory(renderer, 0x10) ||
-        *reinterpret_cast<DWORD*>(registry + 0x30) != 3) {
+    if (!IsReadableMemory(registry, 0x34) || !IsReadableMemory(renderer, 0x10)) {
+        return false;
+    }
+
+    const DWORD viewport_count = *reinterpret_cast<DWORD*>(registry + 0x30);
+    if (viewport_count != 3 && viewport_count != 4) {
+        return false;
+    }
+    if (!IsReadableMemory(registry, 0x34 + static_cast<size_t>(viewport_count) * 0x18)) {
         return false;
     }
 
@@ -775,12 +1322,13 @@ bool IsLiveThreePlayerGridState()
 
     const DWORD half_width = device_width / 2;
     const DWORD half_height = device_height / 2;
-    const DWORD expected[3][4] = {
+    const DWORD expected[4][4] = {
         {0, 0, half_width, half_height},
         {half_width, 0, half_width, half_height},
         {0, half_height, half_width, half_height},
+        {half_width, half_height, half_width, half_height},
     };
-    for (DWORD i = 0; i < 3; ++i) {
+    for (DWORD i = 0; i < viewport_count; ++i) {
         auto* record = registry + 0x34 + i * 0x18;
         for (DWORD field = 0; field < 4; ++field) {
             if (*reinterpret_cast<DWORD*>(record + field * sizeof(DWORD)) != expected[i][field]) {
@@ -1154,7 +1702,7 @@ __declspec(naked) void VerticalSplitRaceMapHook4C1889()
 bool BeginVerticalHudPass()
 {
     g_splitscreen_vertical_hud_pass_active = IsLiveVerticalSplitscreenVisualState();
-    g_splitscreen_grid_hud_pass_active = IsLiveThreePlayerGridState();
+    g_splitscreen_grid_hud_pass_active = IsLiveGridSplitscreenState();
     return g_splitscreen_vertical_hud_pass_active;
 }
 
@@ -1354,7 +1902,9 @@ bool GetValidatedSplitscreenLocalPlayerCount(std::uint8_t* game_flow, DWORD* pla
             found_non_local = true;
         }
     }
-    if (count < 2 || count > 3 || (count == 3 && !g_splitscreen_three_player_capable)) {
+    if (count < 2 || count > 4 ||
+        (count == 3 && !g_splitscreen_three_player_capable) ||
+        (count == 4 && !g_splitscreen_four_player_capable)) {
         return false;
     }
 
@@ -2266,12 +2816,81 @@ bool SplitscreenBranchMatches(const SplitscreenPatchSite& site)
     return std::memcmp(site.address, expected_branch, site.patch_size) == 0;
 }
 
+bool PatchFourPlayerInputLifecycle(const ModuleRange& range)
+{
+    g_splitscreen_four_player_capable = false;
+    if (!g_splitscreen_three_player_capable) {
+        Log("Splitscreen4P: three-player presentation capability unavailable; lifecycle hooks skipped");
+        return false;
+    }
+    if (IsReadableMemory(reinterpret_cast<void*>(0x008E844C), sizeof(void*)) &&
+        *reinterpret_cast<void**>(0x008E844C) != nullptr) {
+        Log("Splitscreen4P: input manager already exists; refusing asynchronous late installation");
+        return false;
+    }
+
+    const std::uint8_t backend_update_expected[] = {0x53, 0x56, 0x57, 0x8B, 0xF8};
+    const std::uint8_t backend_shutdown_expected[] = {0x8B, 0x77, 0x28, 0x85, 0xF6};
+    const std::uint8_t backend_clear_expected[] = {0xC7, 0x47, 0x28, 0x00, 0x00, 0x00, 0x00};
+    const std::uint8_t constructor_call_expected[] = {0xE8, 0xD7, 0xED, 0x02, 0x00};
+    // Infrastructure is installed first. The constructor CALL is the only
+    // activation point and is deliberately installed last (and rolled back first).
+    const SplitscreenPatchSite sites[] = {
+        {reinterpret_cast<std::uint8_t*>(0x0055B490), backend_update_expected, sizeof(backend_update_expected), sizeof(backend_update_expected), reinterpret_cast<void*>(&SplitscreenFourPlayerBackendUpdate55B490), "four-player-backend-update", false},
+        {reinterpret_cast<std::uint8_t*>(0x0055011D), backend_shutdown_expected, sizeof(backend_shutdown_expected), sizeof(backend_shutdown_expected), reinterpret_cast<void*>(&SplitscreenFourPlayerBackendShutdown55011D), "four-player-backend-shutdown", false},
+        {reinterpret_cast<std::uint8_t*>(0x00550175), backend_clear_expected, sizeof(backend_clear_expected), sizeof(backend_clear_expected), reinterpret_cast<void*>(&SplitscreenFourPlayerBackendClear550175), "four-player-backend-clear", false},
+        {reinterpret_cast<std::uint8_t*>(0x00521134), constructor_call_expected, sizeof(constructor_call_expected), sizeof(constructor_call_expected), reinterpret_cast<void*>(&SplitscreenFourPlayerConstructorCall521134), "four-player-post-constructor", true},
+    };
+
+    for (const SplitscreenPatchSite& site : sites) {
+        if (!ModuleContains(range, site.address, site.expected_size) ||
+            std::memcmp(site.address, site.expected, site.expected_size) != 0) {
+            char actual[48] = {};
+            if (ModuleContains(range, site.address, site.expected_size)) {
+                FormatBytes(site.address, site.expected_size, actual, sizeof(actual));
+            } else {
+                std::snprintf(actual, sizeof(actual), "outside executable");
+            }
+            Log("Splitscreen4P: signature mismatch for %s at 0x%p actual=%s; maximum remains 3",
+                site.label, site.address, actual);
+            return false;
+        }
+    }
+
+    size_t installed = 0;
+    for (; installed < sizeof(sites) / sizeof(sites[0]); ++installed) {
+        const SplitscreenPatchSite& site = sites[installed];
+        const bool wrote = site.call
+            ? WriteCall(site.address, site.hook, site.patch_size)
+            : WriteJump(site.address, site.hook, site.patch_size);
+        if (!wrote || !SplitscreenBranchMatches(site)) {
+            Log("Splitscreen4P: failed to install/verify %s; rolling back lifecycle hooks", site.label);
+            if (std::memcmp(site.address, site.expected, site.patch_size) != 0) {
+                WriteMemory(site.address, site.expected, site.patch_size);
+            }
+            break;
+        }
+    }
+    if (installed != sizeof(sites) / sizeof(sites[0])) {
+        while (installed > 0) {
+            --installed;
+            const SplitscreenPatchSite& site = sites[installed];
+            WriteMemory(site.address, site.expected, site.patch_size);
+        }
+        return false;
+    }
+
+    Log("Splitscreen4P: lifecycle hooks installed; capability will activate only if XInput user 2 is connected during native input construction");
+    return true;
+}
+
 bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
 {
     const bool selected_vertical = g_splitscreen_vertical_layout;
     g_splitscreen_vertical_layout = false;
     g_splitscreen_vertical_capable = false;
     g_splitscreen_three_player_capable = false;
+    g_splitscreen_four_player_capable = false;
     g_splitscreen_vertical_render_active = false;
     g_splitscreen_vertical_hud_pass_active = false;
     g_splitscreen_grid_hud_pass_active = false;
@@ -2917,8 +3536,12 @@ void ApplyPatches()
 
     if (g_splitscreen_fix) {
         const bool splitscreen_installed = PatchSplitscreenFix(exe);
+        bool splitscreen_presentation_installed = false;
         if (splitscreen_installed) {
-            PatchVerticalSplitscreenLayout(exe);
+            splitscreen_presentation_installed = PatchVerticalSplitscreenLayout(exe);
+        }
+        if (splitscreen_installed && splitscreen_presentation_installed) {
+            PatchFourPlayerInputLifecycle(exe);
         }
         if (splitscreen_installed && g_splitscreen_zoom_input_fix) {
             PatchSplitscreenZoomInputFix();

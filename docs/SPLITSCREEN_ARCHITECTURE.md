@@ -2,10 +2,11 @@
 
 This document records the evidence, current design, and extension boundary for the
 split-screen implementation in `modules/zpatch_reimpl`. Its main purpose is to keep
-future three- and four-player work from repeating the two-player reverse-engineering
+future multi-player work from repeating the two-player reverse-engineering
 or mistaking dormant rendering paths for complete multi-player support. Three-player
-and four-player input are separate milestones: the stock PC input topology can expose
-keyboard plus two pads, while a fourth player requires a new input device path.
+and four-player input remain separate capabilities: the stock PC topology exposes
+keyboard plus two pads, while the fourth player uses a separately validated XInput
+slot-3 adapter. Four physical pads remain a different, unsupported topology.
 
 The implementation is experimental and is pinned to the current Steam executable:
 
@@ -16,7 +17,7 @@ The implementation is experimental and is pinned to the current Steam executable
 | `SizeOfImage` | `0x00541000` |
 | PE timestamp | `0x451D02BD` |
 | Game mode | `GM_SPLITSCREEN == 10` |
-| Current supported player count | exactly 2 |
+| Current supported player count | 2 or 3; 4 when the startup XInput slot-3 transaction succeeds |
 | Native viewport counts explicitly laid out by the PC executable | 1, 2, and 4; count 3 is incomplete |
 
 Addresses below are virtual addresses in that executable unless stated otherwise.
@@ -149,14 +150,30 @@ second per-pad pointer array occupies `+0x467C/+0x4680`, and pad state is addres
 as `backend + 0x4444 + index*0x104`. A third such record would overlap metadata
 near `+0x466C`. This is a hard two-pad backend, not an enumeration setting.
 
-The current registry therefore safely exposes at most keyboard plus two pads. A
-plain `+0x04 = 4` patch makes generic loops virtual-call through the backend pointer.
-A still-unproven keyboard-plus-three-pads candidate is narrower than a full registry
-replacement: relocate the real backend pointer into an ASI sidecar, patch manager
-initialization/update/destruction to use it, repurpose `+0x28` as contiguous device
-slot 3, and install a genuine game-compatible XInput-backed device there. This
-still requires a complete device ABI/action-map implementation; it is not a count
-patch.
+The stock registry therefore safely exposes at most keyboard plus two pads. A plain
+`+0x04 = 4` patch is invalid because generic loops would virtual-call through the
+backend pointer. The implemented keyboard-plus-three-pads extension instead saves
+the real backend in an ASI sidecar, redirects its central update and destruction,
+repurposes manager `+0x28` as contiguous device slot 3, and publishes count 4 only
+after a game-compatible XInput adapter completes initialization.
+
+The adapter is an `0x8EC` native-layout pad object with a private `0x5098` shadow
+backend. Its writable clone of the 54-entry stock pad vtable overrides deleting
+destruction, per-frame polling, default-map enumeration, and detach; all other name,
+GUID, mapping, analog, held, pressed, and remap behavior remains native. XInput user
+2 is translated into a `DIJOYSTATE2` snapshot: current state is stored at shadow
+`+0x2224`, previous state at `+0x4684`, and the compact analog source at `+0x0000`.
+The native pad evaluator at `0x0055D480` then produces the same action/edge fields as
+the two stock pads. A transient borrowed stock DirectInput pointer is used only while
+the native default-map enumerator runs; it is never retained by the shadow.
+
+Four-player activation is deliberately runtime-gated. The lifecycle transaction
+must install before the input manager exists, the native constructor must finish with
+exactly keyboard plus two pads, XInput user 2 must be connected, the translator
+self-test and native identity initializer must pass, and four unique readable device
+slots must validate. Otherwise manager `+0x28` remains the real backend, count stays
+3, and `Input.GetSplitscreenMaxPlayers()` reports 3. Temporary later disconnects
+mark the adapter disconnected without changing the registered topology.
 
 Four pads are a different topology. Keeping keyboard at index 0 means five total
 devices and pad indices 1 through 4. That exceeds both the inline pointer array and
@@ -423,15 +440,15 @@ stateDiagram-v2
     ReadyPrompt --> Race: each prompt accepted only by its selected device
 ```
 
-The current 3P implementation generalizes the following assumptions together.
+The current 3P/4P implementation generalizes the following assumptions together.
 Changing only the visible menu maximum would still produce invalid layout records
 or an unwinnable ready prompt.
 
 | Current assumption | Location/function | Required 3/4-player form |
 | --- | --- | --- |
-| `players.num_players ~= 2` aborts | `multiplayermenu.bed`, `StartSplitscreen` | advertise `{2,3}` first; add 4 only with a fourth device backend |
+| `players.num_players ~= 2` aborts | `multiplayermenu.bed`, `StartSplitscreen` | advertise 2/3, plus 4 only after slot-3 capability activates |
 | loops validate `1,2` | `StartSplitscreen` and split-input helpers | loop through `state.num_players` |
-| `maxplayers = 2` | `partymodemenu.bed`, `set_buttons` | derive the maximum from a native split capability, initially 3 |
+| `maxplayers = 2` | `partymodemenu.bed`, `set_buttons` | derive 2/3/4 from the native split capability |
 | selector widgets exist for players 1 and 2 | `SetPlayerBars`, `menu_partymode.init` | generate rows/widgets up to supported split count |
 | selector snapshots and restores two indices | `start_splitinput`, `end_splitinput`, `deinit` | snapshot/restore `state.num_players` entries |
 | layout row is represented as selector row 3 | `splitinput_setselected`, `cycle_splitinput`, input handler | include orientation only for exact 2; grid layout is fixed for 3/4 |
@@ -541,8 +558,25 @@ orientation-hook failure forces and persists horizontal. The registration hook a
 `Input.SetSplitscreenLayoutHorizontal()`, and
 `Input.SetSplitscreenLayoutVertical()` to the existing `Input` Lua table before the
 BFS override is mounted. The layout functions' 0..3 result reports live
-orientation/capability; the maximum-player getter returns 3 only after the complete
-split-presentation transaction installs. BED code never opens the persisted file.
+orientation/capability; the maximum-player getter returns 3 after the complete
+split-presentation transaction installs and 4 only after the later slot-3 adapter
+publishes successfully. BED code never opens the persisted file.
+
+### Four-player input lifecycle transaction
+
+| Site | Stock bytes/purpose | Hook |
+| ---: | --- | --- |
+| `0x0055B490` | `53 56 57 8B F8`, central backend-update entry | substitutes the sidecar stock backend only when an inlined manager path passes slot-3 adapter as `EAX` |
+| `0x0055011D` | `8B 77 28 85 F6`, manager backend destruction load | resolves the saved stock backend |
+| `0x00550175` | `C7 47 28 00 00 00 00`, backend/slot clear | clears both sidecar and repurposed slot |
+| `0x00521134` | `E8 D7 ED 02 00`, native input-manager constructor call | calls stock first, then conditionally installs adapter |
+
+This is a separate all-or-nothing transaction installed after core and presentation
+support. The three infrastructure sites install first and the constructor activation
+CALL installs last; rollback restores the activation site first. A signature failure
+therefore leaves the complete 2P/3P build operational. The central backend detour is
+required because six inlined update paths bypass the manager helper at `0x005501AF`.
+Manager `+0x08` remains 2 throughout.
 
 ## Three- and four-player blockers
 
@@ -551,7 +585,7 @@ split-presentation transaction installs. BED code never opens the persisted file
 | P0 | 3P | stock count-3 layout initializes only record 0 | TL/TR/BL records are validated and rendered with BR empty |
 | P0 | 3P | scripts and ready/Zoom ordinal bounds are literal 2 | all loops derive from one advertised `{2,3}` capability |
 | P0 | 3/4P | exact-two camera selection loads generic `camera.ini` | captured camera behavior supports an evidence-backed predicate change |
-| P0 | 4P | only keyboard plus two stock pads exist | a stable slot-3 device passes every manager/Lua/gameplay query |
+| runtime gate | 4P | XInput user 2 must be present during manager construction | restart with three connected pads; failed activation remains a safe 3P build |
 | P0 | four pads | keyboard makes pad 4 source index 4, beyond inline pointers and the four-DWORD claim table | an explicit five-device or pad-only-remap design passes lifecycle tests |
 | P1 | 3/4P | P2 HUD anchors assume top/bottom | grid P2 retains top anchors and all players retain their backgrounds |
 | P1 | 3/4P | shared-map gate samples only the first two participant contexts | P3/P4 visibility and markers are count-driven or proven acceptable |
@@ -601,17 +635,17 @@ and 3-to-2 transitions are stable.
 Exit: a four-view race renders and returns safely; independent fourth-player input is
 explicitly out of scope.
 
-### Stage 3: keyboard plus three pads
+### Stage 3: keyboard plus three pads (implemented; runtime acceptance pending)
 
-- Complete the input-manager `+0x28`, backend, destructor/update, and pad-device ABI
-  xref audit before selecting an architecture.
-- Evaluate the illustrative sidecar candidate: relocate backend ownership and install
-  a game-compatible third-pad object at contiguous slot 3.
-- Set device count to 4 only after whichever design is chosen validates transactionally.
-- Implement stable name, GUID, type, connection, action-map, held, and pressed behavior.
-- Validate stock Lua/direct indexed consumers against the new object.
-- Confirm Zoom maps the physical third pad to source slot 3.
-- Advertise player count 4 only after the device transaction succeeds.
+- Retain backend ownership in an ASI sidecar and install a native-layout XInput pad
+  object at contiguous slot 3.
+- Set device count to 4 only after the separate lifecycle transaction and runtime
+  post-install invariants pass.
+- Preserve stable name/GUID/type, native action-map/remap behavior, held/pressed
+  edges, disconnect state, and saved controller selection.
+- Accept native source 3 and supported-Zoom SDL player index 2 as slot 3; Zoom remains
+  optional and does not gate native 4P capability.
+- Advertise 4 only after the device transaction succeeds; otherwise advertise 3.
 
 Exit: keyboard plus three pads independently drive four cars and sources 0..3 retain
 correct ready ownership.
@@ -689,7 +723,7 @@ support until exercised.
 
 | Area | Required cases |
 | --- | --- |
-| device topology | keyboard plus three pads first; four pads only after its separate architecture; disconnect/reconnect every slot |
+| device topology | launch with keyboard plus three pads connected; verify slot indices 0..3, adapter name/GUID/type, temporary third-pad disconnect/reconnect, and safe max-3 fallback when it is absent at startup; four pads are unsupported |
 | ownership | for each prompt, test all four devices; exactly one must accept |
 | layout | 4:3, 16:9, 16:10, 21:9; even and odd width/height; window resize/reset if supported |
 | camera/FOV | chase, bumper, hood, reverse/look-back, crash/reset, finish camera |
@@ -697,7 +731,7 @@ support until exercised.
 | race types | race, derby, and every mode the UI exposes; explicitly reject unsupported stunt/event paths |
 | post-process | off/on; motion blur, bloom, damage/flash effects, split boundaries, final viewport restoration |
 | lifecycle | repeated race start/finish/restart, return to menu, change player count 4 to 3/2 and back |
-| compatibility | no Zoom, supported Zoom, unknown Zoom, known input wrapper mods, clean Steam install |
+| compatibility | no Zoom native source 3, supported Zoom SDL player index 2 -> slot 3, unknown Zoom fail-safe behavior, known input wrapper mods, clean Steam install |
 | performance | frame time, one-percent lows, memory growth, long race, particle-heavy pileup |
 
 ## Rules for future patches
@@ -718,18 +752,15 @@ support until exercised.
 
 ## Open questions
 
-1. Can a stock pad object use a private backend-shaped XInput shim for slot 3, or is
-   a complete custom game-device vtable smaller and safer?
-2. Which split exit owns restoration if a future four-pad mode temporarily hides the
+1. Which split exit owns restoration if a future four-pad mode temporarily hides the
    keyboard, including failed race start and process detach?
-3. What projection matrix does the unmodified count-4 path produce at each aspect
+2. What projection matrix does the unmodified count-4 path produce at each aspect
    ratio, and is its FOV policy intentional?
-4. Does the first-two-context shared-map gate omit P3/P4-only map states?
-5. Is pause ownership one designated player or any local context at counts 3/4?
-6. Does full-frame post-processing sample across quadrant boundaries for any shipped
+3. Does the first-two-context shared-map gate omit P3/P4-only map states?
+4. Is pause ownership one designated player or any local context at counts 3/4?
+5. Does full-frame post-processing sample across quadrant boundaries for any shipped
    or Zoom-provided shader?
 
-These questions are gates for implementation, not invitations to broaden the first
-three-player patch. The lowest-jank path is to make keyboard-plus-two-pad 3P work
-with a complete custom layout, then treat fourth-device input as a discrete,
-transactional subsystem.
+These questions are runtime/release gates, not evidence that count patches alone are
+safe. The fourth-device adapter remains a discrete transaction so the established
+keyboard-plus-two-pad 3P path survives every 4P signature or runtime failure.

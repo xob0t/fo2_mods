@@ -41,8 +41,8 @@ end
 
 local function QuerySplitMaxPlayers()
 	local result=Input.GetSplitscreenMaxPlayers()
-	if type(result) == "number" and result == math.floor(result) and result == 3 then
-		return 3
+	if type(result) == "number" and result == math.floor(result) and result >= 2 and result <= 4 then
+		return result
 	end
 	return 2
 end
@@ -240,8 +240,8 @@ end
 local function SplitControllerLaunchError()
 	local maxplayers=state.max_split_players or QuerySplitMaxPlayers()
 	if state.num_players < 2 or state.num_players > maxplayers then
-		if maxplayers == 3 then
-			return L"SPLIT SCREEN REQUIRES TWO OR THREE PLAYERS."
+		if maxplayers >= 3 then
+			return L(string.format("SPLIT SCREEN REQUIRES BETWEEN TWO AND %d PLAYERS.",maxplayers))
 		end
 		return L"SPLIT SCREEN REQUIRES EXACTLY TWO PLAYERS."
 	end
@@ -459,7 +459,7 @@ local function SetPlayerBars()
 		W("party_name_header"):SetAlpha(editing and 0 or 1)
 		W("party_car_header"):SetAlpha(editing and 0 or 1)
 		W("split_setup_header"):SetAlpha(editing and 1 or 0)
-		for i=1,3 do
+		for i=1,4 do
 			local prefix=string.format("player%d_input",i)
 			if not editing or i > state.num_players then
 				W(prefix.."_bar"):SetAlpha(0)
@@ -486,6 +486,8 @@ local function SetPlayerBars()
 		layoutvalue:SetAlpha(showlayout and 1 or 0)
 		if state.num_players == 3 then
 			layoutvalue:SetTitle(L"3-PLAYER GRID (ONE QUADRANT EMPTY)")
+		elseif state.num_players == 4 then
+			layoutvalue:SetTitle(L"4-PLAYER GRID")
 		else
 			layoutvalue:SetTitle(SplitLayoutLabel(state.split_vertical,state.split_vertical_capable))
 		end
@@ -814,7 +816,7 @@ function menu_partymode.init(self)
 		StaticText{Name="split_setup_header",Title=L"SPLIT SETUP",Font=fontsmall(),Position=POS(278,110),Color=GetPaletteColor(33),Align=FONTF_RIGHT}
 		local inputarrowsize=GetResourceSize(self:getResource("selection_arrow_l"))
 		local inputy=131
-		for i=1,3 do
+		for i=1,4 do
 			local prefix=string.format("player%d_input",i)
 			Frame{Name=prefix.."_bar",Position=POS(0,inputy),Size=SIZE(640,20)}:AttachResource(self:getResource("black_transparent_50"))
 			StaticText{Name=prefix.."_label",Title=ConvertToWString(string.format("PLAYER %d",i)),Position=POS(278,inputy),Font=fontsmall(),Color=GetPaletteColor(34),Align=FONTF_RIGHT}
