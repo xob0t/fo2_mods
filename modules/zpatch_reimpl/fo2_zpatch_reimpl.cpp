@@ -945,10 +945,29 @@ void DrawVerticalSplitRaceMap(
         return;
     }
 
+    const auto* x_scale_instruction =
+        reinterpret_cast<const std::uint8_t*>(0x004C6EEB);
+    if (!IsReadableMemory(x_scale_instruction, 6) ||
+        x_scale_instruction[0] != 0xD8 || x_scale_instruction[1] != 0x0D) {
+        CallOriginalSplitRaceMap(map_state, position, size, icon_size);
+        return;
+    }
+
+    // 0x004C6ED0 multiplies map X coordinates by renderer width and the
+    // floating-point operand referenced by this instruction. Widescreen mods
+    // may repoint the operand at runtime, so follow the live pointer rather
+    // than assuming the stock 0x0067DBE4 address.
+    const auto* x_normalization_address =
+        *reinterpret_cast<const float* const*>(0x004C6EED);
+    if (!IsReadableMemory(x_normalization_address, sizeof(float))) {
+        CallOriginalSplitRaceMap(map_state, position, size, icon_size);
+        return;
+    }
+
     const DWORD full_width = *reinterpret_cast<DWORD*>(display + 0x04);
     const DWORD full_height = *reinterpret_cast<DWORD*>(display + 0x08);
     const DWORD map_renderer_width = *reinterpret_cast<DWORD*>(renderer + 0x08);
-    const float x_normalization = *reinterpret_cast<const float*>(0x0067DBE4);
+    const float x_normalization = *x_normalization_address;
     const float map_width = size[0];
     if (full_width == 0 || full_height == 0 ||
         map_renderer_width == 0 ||
