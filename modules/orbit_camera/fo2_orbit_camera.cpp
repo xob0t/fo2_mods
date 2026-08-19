@@ -31,7 +31,6 @@ constexpr uintptr_t kZoomVectorEnd = 0x000FED00;
 constexpr size_t kZoomRecordSize = 0x3C;
 constexpr size_t kMatrixSize = 64;
 constexpr float kPi = 3.14159265358979323846f;
-constexpr float kTwoPi = 2.0f * kPi;
 
 enum class InputSource { Auto, ZoomSDL, Native };
 
@@ -41,9 +40,6 @@ struct Config {
     float deadzone_enter = 0.20f;
     float deadzone_exit = 0.15f;
     float curve = 1.0f;
-    float engage_time = 0.04f;
-    float return_time = 0.07f;
-    float max_speed = 2400.0f * kPi / 180.0f;
     bool invert_x = false;
     bool invert_y = false;
     int zoom_axis_x = 2;
@@ -60,8 +56,6 @@ struct OrbitState {
     void* device = nullptr;
     unsigned config_generation = 0;
     DWORD last_tick = 0;
-    float yaw = 0.0f;
-    float velocity = 0.0f;
     bool stick_active = false;
 };
 
@@ -160,9 +154,6 @@ void LoadConfig(bool first)
     next.deadzone_enter = ClampFloat(ReadFloat("DeadzoneEnter", 0.20f), 0.01f, 0.95f);
     next.deadzone_exit = ClampFloat(ReadFloat("DeadzoneExit", 0.15f), 0.0f, next.deadzone_enter);
     next.curve = ClampFloat(ReadFloat("AxisCurveExponent", 1.0f), 0.25f, 4.0f);
-    next.engage_time = ClampFloat(ReadFloat("EngageSmoothTime", 0.04f), 0.001f, 2.0f);
-    next.return_time = ClampFloat(ReadFloat("ReturnSmoothTime", 0.07f), 0.001f, 2.0f);
-    next.max_speed = ClampFloat(ReadFloat("MaxYawSpeedDeg", 2400.0f), 1.0f, 5000.0f) * kPi / 180.0f;
     next.invert_x = GetPrivateProfileIntA("orbit_camera", "InvertX", 0, g_ini_path) != 0;
     next.invert_y = GetPrivateProfileIntA("orbit_camera", "InvertY", 0, g_ini_path) != 0;
     next.zoom_axis_x = std::max(0, std::min(8, static_cast<int>(GetPrivateProfileIntA("orbit_camera", "ZoomAxisX", 2, g_ini_path))));
@@ -413,31 +404,11 @@ void ResetState(void* controller)
     for (auto& state : g_states) if (state.controller == controller) state = OrbitState{};
 }
 
-float UnwrapNear(float target, float current)
-{
-    while (target - current > kPi) target -= kTwoPi;
-    while (target - current < -kPi) target += kTwoPi;
-    return target;
-}
-
 float StickTargetYaw(float x, float y)
 {
     // Pulling the stick back looks behind. Pushing it forward returns to the
     // normal chase direction; horizontal directions remain fixed side views.
     return std::atan2(x, -y);
-}
-
-float SmoothDamp(float current, float target, float& velocity, float smooth_time, float max_speed, float dt)
-{
-    const float omega = 2.0f / std::max(0.001f, smooth_time);
-    const float x = omega * dt;
-    const float decay = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
-    float change = current - target;
-    change = ClampFloat(change, -max_speed * smooth_time, max_speed * smooth_time);
-    target = current - change;
-    const float temp = (velocity + omega * change) * dt;
-    velocity = (velocity - omega * temp) * decay;
-    return target + (change + temp) * decay;
 }
 
 void RotateMatrix(const float* source, float* destination, float yaw)
@@ -526,7 +497,6 @@ void __fastcall CameraUpdateHook(void* active_ptr, void*, float dt)
     if (!ResolveDevice(controller, device, slot, manager)) { ResetState(controller); call_original(); return; }
     OrbitState& state = GetState(controller);
     if (state.active != active_ptr || state.device != device || state.config_generation != g_config.generation) {
-        state.yaw = state.velocity = 0.0f;
         state.stick_active = false;
         state.active = active_ptr;
         state.device = device;
@@ -549,17 +519,10 @@ void __fastcall CameraUpdateHook(void* active_ptr, void*, float dt)
     }
     if (state.stick_active) { if (magnitude <= g_config.deadzone_exit) state.stick_active = false; }
     else if (magnitude >= g_config.deadzone_enter) state.stick_active = true;
-    float target = state.stick_active ? StickTargetYaw(x, y) : 0.0f;
-    target = UnwrapNear(target, state.yaw);
-    const float step = ClampFloat(Finite(dt) ? dt : 0.0f, 0.0f, 1.0f / 15.0f);
-    state.yaw = SmoothDamp(state.yaw, target, state.velocity,
-                           state.stick_active ? g_config.engage_time : g_config.return_time,
-                           g_config.max_speed, step);
-    if (!state.stick_active && std::fabs(state.yaw) < 0.0001f && std::fabs(state.velocity) < 0.0001f) {
-        state.yaw = state.velocity = 0.0f;
+    if (!state.stick_active) {
         call_original(); return;
     }
-    MatrixScope scope(context, state.yaw);
+    MatrixScope scope(context, StickTargetYaw(x, y));
     call_original();
 }
 
@@ -574,9 +537,7 @@ bool RunSelfTests()
     if (std::fabs(StickTargetYaw(1.0f, 0.0f) - kPi * 0.5f) > 0.001f ||
         std::fabs(std::fabs(StickTargetYaw(0.0f, 1.0f)) - kPi) > 0.001f ||
         std::fabs(StickTargetYaw(0.0f, -1.0f)) > 0.001f) return false;
-    float velocity = 0.0f;
-    const float value = SmoothDamp(0.0f, kPi, velocity, 0.04f, 2400.0f * kPi / 180.0f, 1.0f / 60.0f);
-    return Finite(value) && value > 0.0f && value < kPi && Finite(velocity);
+    return true;
 }
 
 bool InstallHook()
