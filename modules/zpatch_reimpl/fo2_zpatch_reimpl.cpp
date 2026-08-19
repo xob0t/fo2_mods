@@ -27,8 +27,10 @@ bool g_splitscreen_post_processing_fix = false;
 bool g_splitscreen_zoom_input_fix = true;
 bool g_splitscreen_vertical_layout = false;
 bool g_splitscreen_vertical_capable = false;
+bool g_splitscreen_three_player_capable = false;
 bool g_splitscreen_vertical_render_active = false;
 bool g_splitscreen_vertical_hud_pass_active = false;
+bool g_splitscreen_grid_hud_pass_active = false;
 bool g_menu_car_backface_culling = true;
 DWORD g_menu_car_max_model_file_size = 524288;
 DWORD g_menu_car_max_skin_file_size = 2097152;
@@ -663,6 +665,16 @@ int __cdecl LuaGetSplitscreenLayoutState(void* lua_state)
     return PushSplitscreenLayoutState(lua_state);
 }
 
+int __cdecl LuaGetSplitscreenMaxPlayers(void* lua_state)
+{
+    using LuaPushIntegerFn = void (__cdecl*)(void*, int);
+    reinterpret_cast<LuaPushIntegerFn>(0x005B46E0)(
+        lua_state,
+        g_splitscreen_three_player_capable ? 3 : 2
+    );
+    return 1;
+}
+
 int __cdecl LuaSetSplitscreenLayoutHorizontal(void* lua_state)
 {
     return SetSplitscreenLayoutFromLua(lua_state, false);
@@ -685,6 +697,7 @@ void __cdecl RegisterSplitscreenLayoutBinding(void* lua_state, int input_table_i
     };
     const Binding bindings[] = {
         {"GetSplitscreenLayoutState", reinterpret_cast<void*>(&LuaGetSplitscreenLayoutState)},
+        {"GetSplitscreenMaxPlayers", reinterpret_cast<void*>(&LuaGetSplitscreenMaxPlayers)},
         {"SetSplitscreenLayoutHorizontal", reinterpret_cast<void*>(&LuaSetSplitscreenLayoutHorizontal)},
         {"SetSplitscreenLayoutVertical", reinterpret_cast<void*>(&LuaSetSplitscreenLayoutVertical)},
     };
@@ -745,12 +758,45 @@ bool IsLiveVerticalSplitscreenVisualState()
         *reinterpret_cast<DWORD*>(right + 0x0C) == device_height;
 }
 
+bool IsLiveThreePlayerGridState()
+{
+    auto* registry = *reinterpret_cast<std::uint8_t**>(0x00696DC8);
+    auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
+    if (!IsReadableMemory(registry, 0x7C) || !IsReadableMemory(renderer, 0x10) ||
+        *reinterpret_cast<DWORD*>(registry + 0x30) != 3) {
+        return false;
+    }
+
+    const DWORD device_width = *reinterpret_cast<DWORD*>(renderer + 0x08);
+    const DWORD device_height = *reinterpret_cast<DWORD*>(renderer + 0x0C);
+    if (device_width < 2 || device_height < 2) {
+        return false;
+    }
+
+    const DWORD half_width = device_width / 2;
+    const DWORD half_height = device_height / 2;
+    const DWORD expected[3][4] = {
+        {0, 0, half_width, half_height},
+        {half_width, 0, half_width, half_height},
+        {0, half_height, half_width, half_height},
+    };
+    for (DWORD i = 0; i < 3; ++i) {
+        auto* record = registry + 0x34 + i * 0x18;
+        for (DWORD field = 0; field < 4; ++field) {
+            if (*reinterpret_cast<DWORD*>(record + field * sizeof(DWORD)) != expected[i][field]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void RefreshVerticalSplitscreenVisualState()
 {
     g_splitscreen_vertical_render_active = IsLiveVerticalSplitscreenVisualState();
 }
 
-void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
+void RewriteSplitscreenLayout(void* layout_object, DWORD viewport_count)
 {
     // Only the world currently published as the renderer's viewport registry
     // owns the live split layout. Other layout builders must not clear the
@@ -761,6 +807,46 @@ void RewriteVerticalSplitscreenLayout(void* layout_object, DWORD viewport_count)
     }
 
     g_splitscreen_vertical_render_active = false;
+    if (viewport_count == 3 && g_splitscreen_three_player_capable) {
+        if (!IsSplitscreenMode()) {
+            return;
+        }
+        if (!IsWritableMemory(layout_object, 0x7C)) {
+            g_splitscreen_three_player_capable = false;
+            Log("Splitscreen 3P: viewport layout is not writable; disabling three-player capability");
+            return;
+        }
+        auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
+        if (!IsReadableMemory(renderer, 0x10)) {
+            g_splitscreen_three_player_capable = false;
+            Log("Splitscreen 3P: renderer dimensions unavailable; disabling three-player capability");
+            return;
+        }
+        const DWORD device_width = *reinterpret_cast<DWORD*>(renderer + 0x08);
+        const DWORD device_height = *reinterpret_cast<DWORD*>(renderer + 0x0C);
+        if (device_width < 2 || device_height < 2) {
+            g_splitscreen_three_player_capable = false;
+            Log("Splitscreen 3P: invalid device dimensions %lux%lu; disabling three-player capability",
+                static_cast<unsigned long>(device_width),
+                static_cast<unsigned long>(device_height));
+            return;
+        }
+        const DWORD half_width = device_width / 2;
+        const DWORD half_height = device_height / 2;
+        const DWORD geometry[3][4] = {
+            {0, 0, half_width, half_height},
+            {half_width, 0, half_width, half_height},
+            {0, half_height, half_width, half_height},
+        };
+        auto* layout = static_cast<std::uint8_t*>(layout_object);
+        for (DWORD i = 0; i < 3; ++i) {
+            auto* record = layout + 0x34 + i * 0x18;
+            for (DWORD field = 0; field < 4; ++field) {
+                *reinterpret_cast<DWORD*>(record + field * sizeof(DWORD)) = geometry[i][field];
+            }
+        }
+        return;
+    }
     if (!g_splitscreen_vertical_capable || !g_splitscreen_vertical_layout || viewport_count != 2) {
         return;
     }
@@ -854,7 +940,7 @@ __declspec(naked) void SplitscreenViewportLayoutCall45CF1B()
         pushad
         push eax
         push ecx
-        call RewriteVerticalSplitscreenLayout
+        call RewriteSplitscreenLayout
         add esp, 8
         call RefreshVerticalSplitscreenVisualState
         popad
@@ -1068,6 +1154,7 @@ __declspec(naked) void VerticalSplitRaceMapHook4C1889()
 bool BeginVerticalHudPass()
 {
     g_splitscreen_vertical_hud_pass_active = IsLiveVerticalSplitscreenVisualState();
+    g_splitscreen_grid_hud_pass_active = IsLiveThreePlayerGridState();
     return g_splitscreen_vertical_hud_pass_active;
 }
 
@@ -1101,6 +1188,8 @@ __declspec(naked) void SplitscreenPositionTitleHook4B9F43()
         jne normal
         cmp byte ptr [g_splitscreen_vertical_hud_pass_active], 0
         jne normal
+        cmp byte ptr [g_splitscreen_grid_hud_pass_active], 0
+        jne normal
         push 0x004B9F4C
         ret
     normal:
@@ -1117,10 +1206,25 @@ __declspec(naked) void SplitscreenPositionValueHook4BA08F()
         jne normal
         cmp byte ptr [g_splitscreen_vertical_hud_pass_active], 0
         jne normal
+        cmp byte ptr [g_splitscreen_grid_hud_pass_active], 0
+        jne normal
         push 0x004BA098
         ret
     normal:
         push 0x004BA0B6
+        ret
+    }
+}
+
+__declspec(naked) void SplitscreenCameraConfigHook4D6BCC()
+{
+    __asm {
+        cmp eax, 2
+        jl stock_camera
+        push 0x004D6BD1
+        ret
+    stock_camera:
+        push 0x004D6BDD
         ret
     }
 }
@@ -1231,6 +1335,39 @@ bool ResolveZoomControllerSlot(const void* captured_esi, DWORD* slot)
     return false;
 }
 
+bool GetValidatedSplitscreenLocalPlayerCount(std::uint8_t* game_flow, DWORD* player_count)
+{
+    if (player_count == nullptr || !IsReadableMemory(game_flow, 0x9C0)) {
+        return false;
+    }
+
+    DWORD count = 0;
+    bool found_non_local = false;
+    for (DWORD i = 0; i < 8; ++i) {
+        const DWORD type = *reinterpret_cast<DWORD*>(game_flow + 0x620 + i * 0x44);
+        if (type == 1) {
+            if (found_non_local) {
+                return false;
+            }
+            ++count;
+        } else {
+            found_non_local = true;
+        }
+    }
+    if (count < 2 || count > 3 || (count == 3 && !g_splitscreen_three_player_capable)) {
+        return false;
+    }
+
+    auto* layout = *reinterpret_cast<std::uint8_t**>(game_flow + 0x9B8);
+    const size_t layout_size = 0x34 + static_cast<size_t>(count) * 0x18;
+    if (!IsReadableMemory(layout, layout_size) ||
+        *reinterpret_cast<DWORD*>(layout + 0x30) != count) {
+        return false;
+    }
+    *player_count = count;
+    return true;
+}
+
 bool GetCurrentSplitscreenReadySelection(DWORD* ordinal, DWORD* desired_controller)
 {
     if (ordinal == nullptr || desired_controller == nullptr || !IsSplitscreenReadyInputState()) {
@@ -1242,9 +1379,14 @@ bool GetCurrentSplitscreenReadySelection(DWORD* ordinal, DWORD* desired_controll
         return false;
     }
 
+    DWORD active_players = 0;
+    if (!GetValidatedSplitscreenLocalPlayerCount(game_flow, &active_players)) {
+        return false;
+    }
+
     const DWORD current_ordinal = *reinterpret_cast<DWORD*>(game_flow + 0x9CC);
     const DWORD device_count = *reinterpret_cast<DWORD*>(input_manager + 0x04);
-    if (current_ordinal >= 2) {
+    if (current_ordinal >= active_players) {
         return false;
     }
     const DWORD current_desired = *reinterpret_cast<DWORD*>(
@@ -1359,10 +1501,15 @@ bool __cdecl ShouldAcceptSplitscreenReadyOwner(void* event_object, void*)
         return false;
     }
 
+    DWORD active_players = 0;
+    if (!GetValidatedSplitscreenLocalPlayerCount(game_flow, &active_players)) {
+        return false;
+    }
+
     DWORD source_controller = *reinterpret_cast<DWORD*>(event_bytes + 0x10);
     const DWORD target_ordinal = *reinterpret_cast<DWORD*>(game_flow + 0x9CC);
     const DWORD device_count = *reinterpret_cast<DWORD*>(input_manager + 0x04);
-    if (target_ordinal >= 2 || source_controller >= device_count) {
+    if (target_ordinal >= active_players || source_controller >= device_count) {
         return false;
     }
 
@@ -1466,8 +1613,9 @@ __declspec(naked) void SplitscreenPlayerCountHook54FF2E()
     __asm {
         // This function runs once during input-manager startup, before a
         // game-flow mode exists. Preserve stock EDI=1 for the mutable current
-        // player/action context at +0x14, but configure the independent
-        // logical local-player count at +0x08 for two-player split screen.
+        // player/action context at +0x14. Manager +0x08 is only a proven
+        // local-multiplayer threshold/state: value 2 enables the split ready
+        // and UI branches, while PlayerInfo records define participant count.
         mov dword ptr [ebp + 0x14], edi
         mov dword ptr [ebp + 0x08], 2
         push 0x0054FF34
@@ -2123,8 +2271,10 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
     const bool selected_vertical = g_splitscreen_vertical_layout;
     g_splitscreen_vertical_layout = false;
     g_splitscreen_vertical_capable = false;
+    g_splitscreen_three_player_capable = false;
     g_splitscreen_vertical_render_active = false;
     g_splitscreen_vertical_hud_pass_active = false;
+    g_splitscreen_grid_hud_pass_active = false;
 
     const std::uint8_t layout_context_expected[] = {
         0x8B, 0x44, 0x24, 0x14,
@@ -2159,6 +2309,7 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
         0x74, 0x25, 0x83, 0x7C, 0x24, 0x20, 0x02, 0x75, 0x1E
     };
     const std::uint8_t split_race_map_expected[] = {0xE8, 0xC2, 0x4E, 0x00, 0x00};
+    const std::uint8_t split_camera_expected[] = {0x83, 0xF8, 0x02, 0x75, 0x0C};
     if (!ModuleContains(range, reinterpret_cast<void*>(0x004B8CA7), sizeof(hud_background_context_expected)) ||
         std::memcmp(reinterpret_cast<void*>(0x004B8CA7), hud_background_context_expected,
             sizeof(hud_background_context_expected)) != 0) {
@@ -2173,6 +2324,7 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
         {reinterpret_cast<std::uint8_t*>(0x004B9F43), position_title_expected, sizeof(position_title_expected), sizeof(position_title_expected), reinterpret_cast<void*>(&SplitscreenPositionTitleHook4B9F43), "vertical-position-title", false},
         {reinterpret_cast<std::uint8_t*>(0x004BA08F), position_value_expected, sizeof(position_value_expected), sizeof(position_value_expected), reinterpret_cast<void*>(&SplitscreenPositionValueHook4BA08F), "vertical-position-value", false},
         {reinterpret_cast<std::uint8_t*>(0x004C1889), split_race_map_expected, sizeof(split_race_map_expected), sizeof(split_race_map_expected), reinterpret_cast<void*>(&VerticalSplitRaceMapHook4C1889), "vertical-race-map-full-device", true},
+        {reinterpret_cast<std::uint8_t*>(0x004D6BCC), split_camera_expected, sizeof(split_camera_expected), sizeof(split_camera_expected), reinterpret_cast<void*>(&SplitscreenCameraConfigHook4D6BCC), "three-player-split-camera", false},
         {reinterpret_cast<std::uint8_t*>(0x0045CF1B), layout_call_expected, sizeof(layout_call_expected), sizeof(layout_call_expected), reinterpret_cast<void*>(&SplitscreenViewportLayoutCall45CF1B), "viewport-layout-builder", true},
     };
 
@@ -2225,6 +2377,7 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
     }
 
     g_splitscreen_vertical_capable = true;
+    g_splitscreen_three_player_capable = true;
     g_splitscreen_vertical_layout = selected_vertical;
     Log(
         "Splitscreen layout runtime: capable=1 selected=%s",
@@ -2280,11 +2433,11 @@ bool PatchSplitscreenFix(const ModuleRange& range)
     const std::uint8_t filesystem_expected[] = {0x68, 0xF8, 0x7D, 0x67, 0x00};
 
     // Install the startup mount last. The replacement script therefore
-    // cannot select GM_SPLITSCREEN until the feature-scoped two-slot setup
+    // cannot select GM_SPLITSCREEN until the feature-scoped multiplayer threshold
     // and every mode-scoped routing detour are already live. All signatures
     // are checked before the first write.
     const SplitscreenPatchSite sites[] = {
-        {reinterpret_cast<std::uint8_t*>(0x0054FF2E), count_expected, sizeof(count_expected), sizeof(count_expected), reinterpret_cast<void*>(&SplitscreenPlayerCountHook54FF2E), "logical-player-count", false},
+        {reinterpret_cast<std::uint8_t*>(0x0054FF2E), count_expected, sizeof(count_expected), sizeof(count_expected), reinterpret_cast<void*>(&SplitscreenPlayerCountHook54FF2E), "local-multiplayer-threshold", false},
         {reinterpret_cast<std::uint8_t*>(0x0045BC5E), ready_owner_expected, sizeof(ready_owner_expected), 5, reinterpret_cast<void*>(&SplitscreenReadyOwnerHook45BC5E), "ready-owner-guard", false},
         {reinterpret_cast<std::uint8_t*>(0x0055D557), held_route_expected, sizeof(held_route_expected), sizeof(held_route_expected), reinterpret_cast<void*>(&SplitscreenHeldRoutingHook55D557), "held-routing", false},
         {reinterpret_cast<std::uint8_t*>(0x0055D627), pressed_route_expected, sizeof(pressed_route_expected), sizeof(pressed_route_expected), reinterpret_cast<void*>(&SplitscreenPressedRoutingHook55D627), "pressed-routing", false},
@@ -2334,7 +2487,7 @@ bool PatchSplitscreenFix(const ModuleRange& range)
     }
 
     Log(
-        "SplitscreenFix: mounted fo2_splitscreen.bfs; logical local-player count=2 with stock current-player context=1; ready/start ownership follows explicit PlayerInfo.Controller selections; four input-routing hooks are mode-scoped; explicit script-selected input indices are active; full-device post-processing=%d",
+        "SplitscreenFix: mounted fo2_splitscreen.bfs; local-multiplayer threshold=2 with stock current-player context=1; ready/start ownership follows explicit PlayerInfo.Controller selections; four input-routing hooks are mode-scoped; explicit script-selected input indices are active; full-device post-processing=%d",
         g_splitscreen_post_processing_fix ? 1 : 0
     );
     return true;

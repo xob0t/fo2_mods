@@ -265,13 +265,19 @@ menu_multiplayer.back=entermenu("menu_mainmenu")
 
 
 local function StartSplitscreen(race, players)
-	if players.num_players ~= 2 then
-		MessageBox(L"SPLIT SCREEN REQUIRES EXACTLY TWO PLAYERS.",MESSAGEBOX_OK,function() EnterMenu("menu_partymode") end)
+	local maxplayers=Input.GetSplitscreenMaxPlayers()
+	if type(maxplayers) ~= "number" or maxplayers ~= math.floor(maxplayers) or maxplayers < 2 or maxplayers > 3 then
+		maxplayers=2
+	end
+	if players.num_players < 2 or players.num_players > maxplayers then
+		local message=L"SPLIT SCREEN REQUIRES EXACTLY TWO PLAYERS."
+		if maxplayers == 3 then message=L"SPLIT SCREEN REQUIRES TWO OR THREE PLAYERS." end
+		MessageBox(message,MESSAGEBOX_OK,function() EnterMenu("menu_partymode") end)
 		return
 	end
 
 	local numcontrollers=Input.GetNumControllers()
-	for i=1,2 do
+	for i=1,players.num_players do
 		local input_index=players.players[i].input_index
 		if type(input_index) ~= "number" or input_index ~= math.floor(input_index) or input_index < 0 or input_index >= numcontrollers then
 			MessageBox(L(string.format("PLAYER %d DOES NOT HAVE A VALID INPUT DEVICE.\n\nRETURN TO PLAYER SETUP AND CHOOSE AN INPUT DEVICE.",i)),MESSAGEBOX_OK,function() EnterMenu("menu_partymode") end)
@@ -279,12 +285,12 @@ local function StartSplitscreen(race, players)
 		end
 		for j=1,i-1 do
 			if players.players[j].input_index == input_index then
-				MessageBox(L"EACH PLAYER MUST USE A DIFFERENT INPUT DEVICE.\n\nRETURN TO PLAYER SETUP AND CHOOSE TWO DIFFERENT DEVICES.",MESSAGEBOX_OK,function() EnterMenu("menu_partymode") end)
+				MessageBox(L"EACH PLAYER MUST USE A DIFFERENT INPUT DEVICE.\n\nRETURN TO PLAYER SETUP AND CHOOSE DISTINCT DEVICES.",MESSAGEBOX_OK,function() EnterMenu("menu_partymode") end)
 				return
 			end
 		end
 	end
-	if players.split_vertical then
+	if players.num_players == 2 and players.split_vertical then
 		Input.SetSplitscreenLayoutVertical()
 	else
 		Input.SetSplitscreenLayoutHorizontal()
