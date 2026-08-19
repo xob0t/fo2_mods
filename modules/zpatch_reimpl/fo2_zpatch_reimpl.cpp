@@ -745,6 +745,20 @@ bool IsLiveVerticalSplitscreenVisualState()
         *reinterpret_cast<DWORD*>(right + 0x0C) == device_height;
 }
 
+bool GetLiveVerticalSplitscreenPhysicalWidth(DWORD* physical_width)
+{
+    if (physical_width == nullptr || !IsLiveVerticalSplitscreenVisualState()) {
+        return false;
+    }
+
+    auto* registry = *reinterpret_cast<std::uint8_t**>(0x00696DC8);
+    auto* right = registry + 0x4C;
+    const DWORD right_x = *reinterpret_cast<DWORD*>(right + 0x00);
+    const DWORD right_width = *reinterpret_cast<DWORD*>(right + 0x08);
+    *physical_width = right_x + right_width;
+    return true;
+}
+
 void RefreshVerticalSplitscreenVisualState()
 {
     g_splitscreen_vertical_render_active = IsLiveVerticalSplitscreenVisualState();
@@ -884,125 +898,61 @@ __declspec(naked) void ProjectionSplitModeSecondaryHook4CBD5D()
     }
 }
 
-__declspec(noinline) void CallOriginalRaceMinimap(
-    void* map_this,
-    float* position,
-    const float* map_size,
-    DWORD arg3,
-    DWORD arg4,
-    void* map_context,
-    DWORD map_type)
+void CenterVerticalRaceMapAndMarkers(float* position, const float* size)
 {
-    __asm {
-        push map_type
-        push map_context
-        push arg4
-        push arg3
-        push map_size
-        push position
-        mov eax, map_this
-        mov ecx, 0x004C5AE0
-        call ecx
-    }
-}
-
-void DrawVerticalRaceMinimap(
-    void* map_this,
-    float* position,
-    const float* size,
-    DWORD arg3,
-    DWORD arg4,
-    void* context,
-    DWORD map_type)
-{
-    bool scissor_changed = false;
-    IDirect3DDevice9* device = nullptr;
-    D3DVIEWPORT9 saved_viewport = {};
-    RECT saved_scissor = {};
-    float original_x = 0.0f;
-
-    const bool position_writable = IsWritableMemory(position, sizeof(float) * 2);
-    const bool size_readable = IsReadableMemory(size, sizeof(float) * 2);
-    const float width = size_readable ? size[0] : 0.0f;
-    auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
-    const bool renderer_readable = IsReadableMemory(renderer, 0x10);
-    const DWORD device_width = renderer_readable ? *reinterpret_cast<DWORD*>(renderer + 0x08) : 0;
-    const DWORD device_height = renderer_readable ? *reinterpret_cast<DWORD*>(renderer + 0x0C) : 0;
-
-    if (IsLiveVerticalSplitscreenVisualState() && map_type == 1 &&
-        position_writable && size_readable && std::isfinite(width) &&
-        width > 0.0f && width <= 640.0f && device_width > 0 && device_height > 0) {
-        device = *reinterpret_cast<IDirect3DDevice9**>(0x008DA788);
-        void** device_vtable = IsReadableMemory(device, sizeof(void*)) ?
-            *reinterpret_cast<void***>(device) : nullptr;
-        if (IsReadableMemory(device_vtable, 0x134)) {
-            DWORD scissor_enabled = FALSE;
-            if (SUCCEEDED(device->GetViewport(&saved_viewport)) &&
-                SUCCEEDED(device->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissor_enabled)) &&
-                (!scissor_enabled || SUCCEEDED(device->GetScissorRect(&saved_scissor)))) {
-                D3DVIEWPORT9 full_viewport = {
-                    0,
-                    0,
-                    device_width,
-                    device_height,
-                    saved_viewport.MinZ,
-                    saved_viewport.MaxZ
-                };
-                RECT full_scissor = {
-                    0,
-                    0,
-                    static_cast<LONG>(device_width),
-                    static_cast<LONG>(device_height)
-                };
-                if (SUCCEEDED(device->SetViewport(&full_viewport))) {
-                    if (!scissor_enabled || SUCCEEDED(device->SetScissorRect(&full_scissor))) {
-                        scissor_changed = scissor_enabled != FALSE;
-                        original_x = position[0];
-                        position[0] = (640.0f - width) * 0.5f;
-                        CallOriginalRaceMinimap(
-                            map_this, position, size, arg3, arg4, context, map_type
-                        );
-                        position[0] = original_x;
-                        if (scissor_changed) {
-                            device->SetScissorRect(&saved_scissor);
-                        }
-                        device->SetViewport(&saved_viewport);
-                        return;
-                    }
-                    device->SetViewport(&saved_viewport);
-                }
-            }
-        }
+    DWORD physical_width = 0;
+    if (!GetLiveVerticalSplitscreenPhysicalWidth(&physical_width) ||
+        !IsWritableMemory(position, sizeof(float) * 2) ||
+        !IsReadableMemory(size, sizeof(float) * 2)) {
+        return;
     }
 
-    // Every validation/query/state failure preserves the stock position and
-    // calls the original renderer under its inherited viewport exactly once.
-    CallOriginalRaceMinimap(map_this, position, size, arg3, arg4, context, map_type);
+    auto* map_renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
+    if (!IsReadableMemory(map_renderer, 0x10)) {
+        return;
+    }
+
+    // 0x004C6ED9 reads this same object, then stock 0x004C6ED0 multiplies
+    // renderer +0x08 by the live normalization factor at 0x0067DBE4. Read both
+    // at the patched CALL so this exactly inverts the scaler used moments later,
+    // including when the widescreen path changes that factor from 1/640.
+    const DWORD map_renderer_width = *reinterpret_cast<DWORD*>(map_renderer + 0x08);
+    const float x_normalization = *reinterpret_cast<const float*>(0x0067DBE4);
+    const float map_width = size[0];
+    if (map_renderer_width == 0 || !std::isfinite(x_normalization) ||
+        x_normalization <= 0.0f || !std::isfinite(map_width) || map_width <= 0.0f) {
+        return;
+    }
+
+    const float x_scale = static_cast<float>(map_renderer_width) * x_normalization;
+    const float centered_x =
+        static_cast<float>(physical_width) / (2.0f * x_scale) - map_width * 0.5f;
+    if (!std::isfinite(x_scale) || x_scale <= 0.0f ||
+        !std::isfinite(centered_x) || centered_x < 0.0f) {
+        return;
+    }
+
+    // This position object remains live for the marker loops after 0x004C6ED0,
+    // so the background and every marker move together.
+    position[0] = centered_x;
 }
 
-__declspec(naked) void SplitscreenRaceMapHook4B9BEB()
+__declspec(naked) void VerticalRaceMapScaleHook4C691D()
 {
     __asm {
-        push ebp
-        mov ebp, esp
-        push ebx
-        push esi
-        push edi
-        push dword ptr [ebp + 0x1C]
-        push dword ptr [ebp + 0x18]
-        push dword ptr [ebp + 0x14]
-        push dword ptr [ebp + 0x10]
-        push dword ptr [ebp + 0x0C]
-        push dword ptr [ebp + 0x08]
+        pushfd
+        pushad
+        push ecx
         push eax
-        call DrawVerticalRaceMinimap
-        add esp, 0x1C
-        pop edi
-        pop esi
-        pop ebx
-        mov esp, ebp
-        pop ebp
-        ret 0x18
+        call CenterVerticalRaceMapAndMarkers
+        add esp, 8
+        popad
+        popfd
+
+        // Preserve EAX=position, ECX=size, ESI=attributes, the native return
+        // address, and both stock stack arguments for 0x004C6ED0 / ret 8.
+        push 0x004C6ED0
+        ret
     }
 }
 
@@ -2099,7 +2049,7 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
     const std::uint8_t position_value_expected[] = {
         0x74, 0x25, 0x83, 0x7C, 0x24, 0x20, 0x02, 0x75, 0x1E
     };
-    const std::uint8_t race_map_expected[] = {0xE8, 0xF0, 0xBE, 0x00, 0x00};
+    const std::uint8_t race_map_scale_expected[] = {0xE8, 0xAE, 0x05, 0x00, 0x00};
     if (!ModuleContains(range, reinterpret_cast<void*>(0x004B8CA7), sizeof(hud_background_context_expected)) ||
         std::memcmp(reinterpret_cast<void*>(0x004B8CA7), hud_background_context_expected,
             sizeof(hud_background_context_expected)) != 0) {
@@ -2113,7 +2063,7 @@ bool PatchVerticalSplitscreenLayout(const ModuleRange& range)
         {reinterpret_cast<std::uint8_t*>(0x004B8CA0), hud_background_expected, sizeof(hud_background_expected), sizeof(hud_background_expected), reinterpret_cast<void*>(&SplitscreenHudBackgroundHook4B8CA0), "vertical-position-background-loop", false},
         {reinterpret_cast<std::uint8_t*>(0x004B9F43), position_title_expected, sizeof(position_title_expected), sizeof(position_title_expected), reinterpret_cast<void*>(&SplitscreenPositionTitleHook4B9F43), "vertical-position-title", false},
         {reinterpret_cast<std::uint8_t*>(0x004BA08F), position_value_expected, sizeof(position_value_expected), sizeof(position_value_expected), reinterpret_cast<void*>(&SplitscreenPositionValueHook4BA08F), "vertical-position-value", false},
-        {reinterpret_cast<std::uint8_t*>(0x004B9BEB), race_map_expected, sizeof(race_map_expected), sizeof(race_map_expected), reinterpret_cast<void*>(&SplitscreenRaceMapHook4B9BEB), "vertical-race-map-center", true},
+        {reinterpret_cast<std::uint8_t*>(0x004C691D), race_map_scale_expected, sizeof(race_map_scale_expected), sizeof(race_map_scale_expected), reinterpret_cast<void*>(&VerticalRaceMapScaleHook4C691D), "vertical-race-map-and-markers-center", true},
         {reinterpret_cast<std::uint8_t*>(0x0045CF1B), layout_call_expected, sizeof(layout_call_expected), sizeof(layout_call_expected), reinterpret_cast<void*>(&SplitscreenViewportLayoutCall45CF1B), "viewport-layout-builder", true},
     };
 
