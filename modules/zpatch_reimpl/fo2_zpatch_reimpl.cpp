@@ -884,44 +884,125 @@ __declspec(naked) void ProjectionSplitModeSecondaryHook4CBD5D()
     }
 }
 
-void CenterVerticalRaceMinimap(float* position, const float* size, DWORD map_type)
+__declspec(noinline) void CallOriginalRaceMinimap(
+    void* map_this,
+    float* position,
+    const float* map_size,
+    DWORD arg3,
+    DWORD arg4,
+    void* map_context,
+    DWORD map_type)
 {
-    if (!IsLiveVerticalSplitscreenVisualState() || map_type != 1 ||
-        !IsWritableMemory(position, sizeof(float) * 2) ||
-        !IsReadableMemory(size, sizeof(float) * 2)) {
-        return;
+    __asm {
+        push map_type
+        push map_context
+        push arg4
+        push arg3
+        push map_size
+        push position
+        mov eax, map_this
+        mov ecx, 0x004C5AE0
+        call ecx
+    }
+}
+
+void DrawVerticalRaceMinimap(
+    void* map_this,
+    float* position,
+    const float* size,
+    DWORD arg3,
+    DWORD arg4,
+    void* context,
+    DWORD map_type)
+{
+    bool scissor_changed = false;
+    IDirect3DDevice9* device = nullptr;
+    D3DVIEWPORT9 saved_viewport = {};
+    RECT saved_scissor = {};
+    float original_x = 0.0f;
+
+    const bool position_writable = IsWritableMemory(position, sizeof(float) * 2);
+    const bool size_readable = IsReadableMemory(size, sizeof(float) * 2);
+    const float width = size_readable ? size[0] : 0.0f;
+    auto* renderer = *reinterpret_cast<std::uint8_t**>(0x008DA718);
+    const bool renderer_readable = IsReadableMemory(renderer, 0x10);
+    const DWORD device_width = renderer_readable ? *reinterpret_cast<DWORD*>(renderer + 0x08) : 0;
+    const DWORD device_height = renderer_readable ? *reinterpret_cast<DWORD*>(renderer + 0x0C) : 0;
+
+    if (IsLiveVerticalSplitscreenVisualState() && map_type == 1 &&
+        position_writable && size_readable && std::isfinite(width) &&
+        width > 0.0f && width <= 640.0f && device_width > 0 && device_height > 0) {
+        device = *reinterpret_cast<IDirect3DDevice9**>(0x008DA788);
+        void** device_vtable = IsReadableMemory(device, sizeof(void*)) ?
+            *reinterpret_cast<void***>(device) : nullptr;
+        if (IsReadableMemory(device_vtable, 0x134)) {
+            DWORD scissor_enabled = FALSE;
+            if (SUCCEEDED(device->GetViewport(&saved_viewport)) &&
+                SUCCEEDED(device->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissor_enabled)) &&
+                (!scissor_enabled || SUCCEEDED(device->GetScissorRect(&saved_scissor)))) {
+                D3DVIEWPORT9 full_viewport = {
+                    0,
+                    0,
+                    device_width,
+                    device_height,
+                    saved_viewport.MinZ,
+                    saved_viewport.MaxZ
+                };
+                RECT full_scissor = {
+                    0,
+                    0,
+                    static_cast<LONG>(device_width),
+                    static_cast<LONG>(device_height)
+                };
+                if (SUCCEEDED(device->SetViewport(&full_viewport))) {
+                    if (!scissor_enabled || SUCCEEDED(device->SetScissorRect(&full_scissor))) {
+                        scissor_changed = scissor_enabled != FALSE;
+                        original_x = position[0];
+                        position[0] = (640.0f - width) * 0.5f;
+                        CallOriginalRaceMinimap(
+                            map_this, position, size, arg3, arg4, context, map_type
+                        );
+                        position[0] = original_x;
+                        if (scissor_changed) {
+                            device->SetScissorRect(&saved_scissor);
+                        }
+                        device->SetViewport(&saved_viewport);
+                        return;
+                    }
+                    device->SetViewport(&saved_viewport);
+                }
+            }
+        }
     }
 
-    const float width = size[0];
-    if (!std::isfinite(width) || width <= 0.0f || width > 640.0f) {
-        return;
-    }
-
-    // The native HUD canvas is always 640 logical units wide. Center the one
-    // shared race map on the full screen, intentionally spanning the divider.
-    position[0] = (640.0f - width) * 0.5f;
+    // Every validation/query/state failure preserves the stock position and
+    // calls the original renderer under its inherited viewport exactly once.
+    CallOriginalRaceMinimap(map_this, position, size, arg3, arg4, context, map_type);
 }
 
 __declspec(naked) void SplitscreenRaceMapHook4B9BEB()
 {
     __asm {
-        pushfd
-        pushad
-        mov eax, dword ptr [esp + 0x3C]
-        mov ecx, dword ptr [esp + 0x2C]
-        mov edx, dword ptr [esp + 0x28]
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        push dword ptr [ebp + 0x1C]
+        push dword ptr [ebp + 0x18]
+        push dword ptr [ebp + 0x14]
+        push dword ptr [ebp + 0x10]
+        push dword ptr [ebp + 0x0C]
+        push dword ptr [ebp + 0x08]
         push eax
-        push ecx
-        push edx
-        call CenterVerticalRaceMinimap
-        add esp, 12
-        popad
-        popfd
-
-        // Tail-dispatch to the original __stdcall renderer without using EAX;
-        // it is a live implicit argument at this call site.
-        push 0x004C5AE0
-        ret
+        call DrawVerticalRaceMinimap
+        add esp, 0x1C
+        pop edi
+        pop esi
+        pop ebx
+        mov esp, ebp
+        pop ebp
+        ret 0x18
     }
 }
 
