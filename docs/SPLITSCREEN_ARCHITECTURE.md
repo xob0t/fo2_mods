@@ -391,7 +391,7 @@ This replaces the earlier numeric-event bridge: Lua's native single-precision nu
 conversion rounded both high private IDs to the same `0x7F020000` value before event
 descriptor lookup, so neither setter event could match. Selection is stored by
 writing an eight-byte temporary file, flushing it, and atomically replacing
-`fo2_splitscreen_layout.lua`. Missing or invalid state defaults to vertical; native
+`fo2_splitscreen_layout.lua`. Missing or invalid state defaults to horizontal; native
 orientation-hook failure forces and persists horizontal. The registration hook adds
 `Input.GetSplitscreenLayoutState()`, `Input.SetSplitscreenLayoutHorizontal()`, and
 `Input.SetSplitscreenLayoutVertical()` to the existing `Input` Lua table before the
@@ -508,7 +508,7 @@ mods, and every unsupported binary fails safely before script mount.
 | pad + pad | horizontal and vertical | absent | off/on | both pads remain distinct through setup, ready prompts, race, pause, and results |
 | keyboard + pad | horizontal and vertical | supported build | off | pad-synthesized Return retains pad identity; keyboard cannot accept pad-owned prompt |
 | pad + pad | horizontal and vertical | supported build | off | each synthesized Return accepts only its own prompt |
-| any valid pair | missing/invalid layout state file | any | any | selector and runtime default to vertical |
+| any valid pair | missing/invalid layout state file | any | any | selector and runtime default to horizontal |
 | any valid pair | simulated native orientation signature failure | any | any | core split remains available, selector/runtime are forced horizontal |
 | odd device width, for example 1365 | vertical | any | any | widths are 682 and 683 with no gap or overlap |
 | device unplugged in selector | either | any | any | assignment becomes invalid, launch is blocked, no out-of-range name query occurs |

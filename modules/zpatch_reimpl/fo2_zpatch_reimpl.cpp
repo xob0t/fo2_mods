@@ -25,7 +25,7 @@ bool g_widescreen_fov_scaling = false;
 bool g_splitscreen_fix = false;
 bool g_splitscreen_post_processing_fix = false;
 bool g_splitscreen_zoom_input_fix = true;
-bool g_splitscreen_vertical_layout = true;
+bool g_splitscreen_vertical_layout = false;
 bool g_splitscreen_vertical_capable = false;
 bool g_splitscreen_vertical_render_active = false;
 bool g_splitscreen_vertical_hud_pass_active = false;
@@ -179,7 +179,7 @@ bool SaveSplitscreenLayoutState(bool vertical);
 
 void LoadSplitscreenLayoutState()
 {
-    g_splitscreen_vertical_layout = true;
+    g_splitscreen_vertical_layout = false;
     HANDLE file = CreateFileA(
         g_splitscreen_layout_state_path,
         GENERIC_READ,
@@ -190,14 +190,14 @@ void LoadSplitscreenLayoutState()
         nullptr
     );
     if (file == INVALID_HANDLE_VALUE) {
-        SaveSplitscreenLayoutState(true);
+        SaveSplitscreenLayoutState(false);
         return;
     }
 
     const DWORD file_size = GetFileSize(file, nullptr);
     if (file_size != 8) {
         CloseHandle(file);
-        SaveSplitscreenLayoutState(true);
+        SaveSplitscreenLayoutState(false);
         return;
     }
 
@@ -206,7 +206,7 @@ void LoadSplitscreenLayoutState()
     const BOOL read_ok = ReadFile(file, contents, 8, &bytes_read, nullptr);
     CloseHandle(file);
     if (!read_ok) {
-        SaveSplitscreenLayoutState(true);
+        SaveSplitscreenLayoutState(false);
         return;
     }
 
@@ -215,7 +215,7 @@ void LoadSplitscreenLayoutState()
     } else if (bytes_read == 8 && std::memcmp(contents, "return 1", 8) == 0) {
         g_splitscreen_vertical_layout = true;
     } else {
-        SaveSplitscreenLayoutState(true);
+        SaveSplitscreenLayoutState(false);
     }
 }
 
