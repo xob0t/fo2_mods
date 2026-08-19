@@ -8,6 +8,11 @@ New-Item -ItemType Directory -Path $dist | Out-Null
 
 $modules = @(
   @{
+    Name = "orbit_camera"
+    Path = Join-Path $PSScriptRoot "modules\orbit_camera"
+    Outputs = @("fo2_orbit_camera.asi", "fo2_orbit_camera.ini")
+  },
+  @{
     Name = "skip_track"
     Path = Join-Path $PSScriptRoot "modules\skip_track"
     Outputs = @("fo2_skip_track.asi", "fo2_skip_track.ini")

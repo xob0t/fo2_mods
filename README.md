@@ -6,6 +6,7 @@ Fully vibecoded, rigorously tested.
 
 ## Mods
 
+- `fo2_orbit_camera`: absolute right-stick orbit camera for the active chase-camera pipeline, with per-player state, deadzones, response tuning, smoothing, and automatic return.
 - `fo2_zpatch_reimpl`: widescreen/FOV fixes, license and intro skips, FPS unlock, frame pacing fix, v-sync removal, borderless windowed mode.
 - `fo2_xinput_rumble`: XInput controller rumble with directional feedback and gameplay-event rumble.
 - `fo2_skip_track`: music track skip from keyboard or controller.
@@ -21,6 +22,22 @@ ASI-based mods include `winmm.dll`, the known-good Ultimate ASI Loader build use
 - Description: `Ultimate ASI Loader`
 
 Avoid `dxwrapper.dll` with these mods unless you specifically need it. It can make frame pacing worse.
+
+## `fo2_orbit_camera`
+
+Source: `modules\orbit_camera`
+
+Install files:
+
+- `fo2_orbit_camera.asi`
+- `fo2_orbit_camera.ini`
+- `winmm.dll`
+
+The mod adds an absolute orbit view to the stock chase camera. Right-stick down, or an idle stick, keeps the native rear chase direction; right and left select the corresponding side views; up selects a look-back view; and diagonals select intermediate angles. It retains the native chase camera's tracking, collision avoidance, field of view, and shake behavior.
+
+Orbit state is maintained independently for each controller. Engagement and return deadzones, response curve, smoothing times, angular speed limit, and axis inversion are configurable in `fo2_orbit_camera.ini`.
+
+Right-stick input is capability-gated. The verified Zoom Platform build can provide the assigned SDL gamepad's right-stick axes. Unknown or absent Zoom builds remain on the native camera behavior instead of guessing an unsafe DirectInput axis mapping.
 
 ## `fo2_zpatch_reimpl`
 
@@ -129,6 +146,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 The top-level build creates `dist\` with all runtime files:
 
 - `winmm.dll`
+- `fo2_orbit_camera.asi`
+- `fo2_orbit_camera.ini`
 - `fo2_zpatch_reimpl.asi`
 - `fo2_zpatch_reimpl.ini`
 - `fo2_splitscreen.bfs`

@@ -15,6 +15,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $GamePath "FlatOut2.exe"))) {
 
 $files = @(
   "winmm.dll",
+  "fo2_orbit_camera.asi",
+  "fo2_orbit_camera.ini",
   "fo2_skip_track.asi",
   "fo2_skip_track.ini",
   "dinput8.dll",
