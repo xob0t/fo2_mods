@@ -24,9 +24,11 @@ The right stick selects an absolute camera angle rather than accumulating rotati
 
 The plugin keeps independent orbit state for each controller and resets state when camera ownership, device assignment, configuration, or chase-camera eligibility changes.
 
-Right-stick input is capability-gated. Automatic input uses the assigned SDL gamepad only with the verified Zoom Platform build. An unknown or absent Zoom build safely leaves the native camera unchanged rather than guessing DirectInput right-stick axes.
+Right-stick input is capability-gated. Automatic input prefers the assigned SDL gamepad with the verified Zoom Platform build, falls back to the game's validated native DirectInput state for stock pads, and uses the split-screen adapter's validated state for player four. Unknown devices or invalid state leave the native camera unchanged.
 
 See `fo2_orbit_camera.ini` for the shipped defaults and configurable deadzones, response curve, smoothing, return, speed limit, and axis inversion options.
+
+`Source=Auto` is recommended. `Source=ZoomSDL` requires the verified Zoom/SDL build and otherwise leaves the stock camera untouched. `Source=Native` uses only validated native DirectInput state (and the validated player-four adapter). The radial `AxisCurveExponent` changes engagement response without changing the absolute stick direction.
 
 ## Building from source
 

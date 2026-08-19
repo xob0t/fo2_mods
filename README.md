@@ -37,7 +37,7 @@ The mod adds an absolute orbit view to the stock chase camera. Right-stick down,
 
 Orbit state is maintained independently for each controller. Engagement and return deadzones, response curve, smoothing times, angular speed limit, and axis inversion are configurable in `fo2_orbit_camera.ini`.
 
-Right-stick input is capability-gated. The verified Zoom Platform build can provide the assigned SDL gamepad's right-stick axes. Unknown or absent Zoom builds remain on the native camera behavior instead of guessing an unsafe DirectInput axis mapping.
+Right-stick input is capability-gated. Automatic mode prefers the assigned SDL gamepad with the verified Zoom Platform build, then falls back to validated native DirectInput state for stock pads or the validated player-four adapter state. Unknown devices safely retain the native camera behavior.
 
 ## `fo2_zpatch_reimpl`
 
