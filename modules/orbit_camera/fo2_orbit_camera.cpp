@@ -23,6 +23,9 @@ constexpr uintptr_t kCameraContextGlobal = 0x008E8424;
 constexpr uintptr_t kInputManagerGlobal = 0x008E844C;
 constexpr uintptr_t kNativePadDisabled = 0x008D8160;
 constexpr uintptr_t kExpectedUpdate = 0x004CE040;
+constexpr uintptr_t kOrbitPointHookSite = 0x004D7E55;
+constexpr uintptr_t kGameFlowGlobal = 0x008E8410;
+constexpr uintptr_t kCompositeVtable = 0x006743D8;
 
 constexpr DWORD kZoomTimestamp = 0x692D78D4;
 constexpr DWORD kZoomImageSize = 0x00106000;
@@ -54,14 +57,18 @@ struct OrbitState {
     void* controller = nullptr;
     void* active = nullptr;
     void* device = nullptr;
+    void* renderer_camera = nullptr;
     unsigned config_generation = 0;
     DWORD last_tick = 0;
     bool stick_active = false;
 };
 
-struct MatrixFrame {
-    float target[16]{};
-    float position[16]{};
+struct OrbitTls {
+    bool active = false;
+    void* controller = nullptr;
+    void* active_definition = nullptr;
+    void* composite = nullptr;
+    float yaw = 0.0f;
 };
 
 using CameraUpdateFn = void(__thiscall*)(void*, float);
@@ -70,9 +77,11 @@ using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
 
 Config g_config;
 OrbitState g_states[8]{};
+__declspec(thread) OrbitTls g_orbit_tls{};
 CameraUpdateFn g_original = reinterpret_cast<CameraUpdateFn>(kExpectedUpdate);
 HMODULE g_module = nullptr;
 std::atomic<bool> g_installed{false};
+std::atomic<bool> g_point_hook_installed{false};
 char g_ini_path[MAX_PATH]{};
 char g_log_path[MAX_PATH]{};
 FILETIME g_ini_write_time{};
@@ -80,8 +89,6 @@ DWORD g_last_config_check = 0;
 HMODULE g_zoom_module = nullptr;
 SDLGetGamepadAxisFn g_sdl_axis = nullptr;
 XInputGetStateFn g_xinput_get_state = nullptr;
-thread_local MatrixFrame g_matrix_frames[4];
-thread_local unsigned g_matrix_depth = 0;
 
 bool IsMemory(const void* pointer, size_t size, bool write = false)
 {
@@ -401,7 +408,10 @@ OrbitState& GetState(void* controller)
 
 void ResetState(void* controller)
 {
-    for (auto& state : g_states) if (state.controller == controller) state = OrbitState{};
+    for (auto& state : g_states) {
+        if (state.controller != controller) continue;
+        state = OrbitState{};
+    }
 }
 
 float StickTargetYaw(float x, float y)
@@ -411,63 +421,79 @@ float StickTargetYaw(float x, float y)
     return std::atan2(x, -y);
 }
 
-void RotateMatrix(const float* source, float* destination, float yaw)
+void RotatePositionOffsetAroundWorldTarget(float* position_offset, const float* source_origin,
+    const float* target, float yaw)
 {
-    std::memcpy(destination, source, kMatrixSize);
     const float c = std::cos(yaw);
     const float s = std::sin(yaw);
-    for (int i = 0; i < 3; ++i) {
-        const float x = source[i];
-        const float z = source[8 + i];
-        destination[i] = c * x - s * z;
-        destination[8 + i] = s * x + c * z;
-    }
+    const float dx = source_origin[0] + position_offset[0] - target[0];
+    const float dz = source_origin[2] + position_offset[2] - target[2];
+    position_offset[0] = target[0] + c * dx - s * dz - source_origin[0];
+    position_offset[2] = target[2] + s * dx + c * dz - source_origin[2];
 }
 
-class MatrixScope {
-public:
-    MatrixScope(std::uint8_t* context, float yaw) : context_(context)
-    {
-        if (g_matrix_depth >= 4 || !IsMemory(context, 0x60, true)) return;
-        target_slot_ = reinterpret_cast<float**>(context + 0x58);
-        position_slot_ = reinterpret_cast<float**>(context + 0x5C);
-        original_target_ = *target_slot_;
-        original_position_ = *position_slot_;
-        if (!IsMemory(original_target_, kMatrixSize) || !IsMemory(original_position_, kMatrixSize)) return;
-        frame_ = &g_matrix_frames[g_matrix_depth++];
-        RotateMatrix(original_target_, frame_->target, yaw);
-        if (original_position_ == original_target_) std::memcpy(frame_->position, frame_->target, kMatrixSize);
-        else RotateMatrix(original_position_, frame_->position, yaw);
-        *target_slot_ = frame_->target;
-        *position_slot_ = frame_->position;
-        active_ = true;
+void __cdecl ApplyOrbitDesiredPoint(std::uint8_t* stack_base, void* composite)
+{
+    const OrbitTls tls = g_orbit_tls;
+    if (!tls.active || tls.composite != composite || !Finite(tls.yaw) ||
+        !IsMemory(stack_base, 0xCC, true) || !IsMemory(composite, sizeof(uintptr_t)) ||
+        *reinterpret_cast<uintptr_t*>(composite) != kCompositeVtable) return;
+
+    std::uint8_t* context = nullptr;
+    if (!ReadAt(kCameraContextGlobal, context) || !IsMemory(context, 0x60)) return;
+    auto* renderer_camera = *reinterpret_cast<std::uint8_t**>(context + 0x50);
+    if (renderer_camera == nullptr || renderer_camera - 0x20 != tls.controller ||
+        !IsMemory(tls.controller, 0x370) ||
+        *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(tls.controller) + 0x364) != tls.active_definition) return;
+
+    auto* active = reinterpret_cast<std::uint8_t*>(tls.active_definition);
+    if (!IsMemory(active, 0x24) || *reinterpret_cast<uintptr_t*>(active) != kCameraDefinitionVtable ||
+        *reinterpret_cast<void**>(active + 0x20) != composite) return;
+    auto* position_component = *reinterpret_cast<std::uint8_t**>(active + 0x0C);
+    auto* target_component = *reinterpret_cast<std::uint8_t**>(active + 0x10);
+    auto* zoom_component = *reinterpret_cast<std::uint8_t**>(active + 0x14);
+    if (!IsMemory(position_component, sizeof(uintptr_t)) || !IsMemory(target_component, sizeof(uintptr_t)) ||
+        !IsMemory(zoom_component, sizeof(uintptr_t)) ||
+        *reinterpret_cast<uintptr_t*>(position_component) != kPosition2Vtable ||
+        *reinterpret_cast<uintptr_t*>(target_component) != kTarget2Vtable ||
+        *reinterpret_cast<uintptr_t*>(zoom_component) != kZoomType1Vtable) return;
+
+    auto* desired_position = reinterpret_cast<float*>(stack_base + 0x20);
+    const auto* look_target = reinterpret_cast<const float*>(stack_base + 0x34);
+    const auto* source_origin = reinterpret_cast<const float*>(stack_base + 0xC0);
+    if (!Finite(desired_position[0]) || !Finite(desired_position[1]) || !Finite(desired_position[2]) ||
+        !Finite(look_target[0]) || !Finite(look_target[1]) || !Finite(look_target[2]) ||
+        !Finite(source_origin[0]) || !Finite(source_origin[1]) || !Finite(source_origin[2])) return;
+    RotatePositionOffsetAroundWorldTarget(desired_position, source_origin, look_target, tls.yaw);
+}
+
+__declspec(naked) void OrbitDesiredPointHook()
+{
+    __asm {
+        pushfd
+        pushad
+        lea eax, [esp + 28h]
+        mov ecx, [esp + 10h]
+        push ecx
+        push eax
+        call ApplyOrbitDesiredPoint
+        add esp, 8
+        popad
+        popfd
+        mov edx, dword ptr ds:[008E8410h]
+        ret
     }
-    ~MatrixScope()
-    {
-        if (!active_) return;
-        if (IsMemory(context_, 0x60, true)) {
-            if (*target_slot_ == frame_->target) *target_slot_ = original_target_;
-            if (*position_slot_ == frame_->position) *position_slot_ = original_position_;
-        }
-        --g_matrix_depth;
-    }
-    bool active() const { return active_; }
-private:
-    std::uint8_t* context_ = nullptr;
-    float** target_slot_ = nullptr;
-    float** position_slot_ = nullptr;
-    float* original_target_ = nullptr;
-    float* original_position_ = nullptr;
-    MatrixFrame* frame_ = nullptr;
-    bool active_ = false;
-};
+}
 
 void __fastcall CameraUpdateHook(void* active_ptr, void*, float dt)
 {
     auto call_original = [&]() { g_original(active_ptr, dt); };
     MaybeReloadConfig();
     auto* active = reinterpret_cast<std::uint8_t*>(active_ptr);
-    if (!g_config.enabled || !IsMemory(active, 0x2C) || *reinterpret_cast<uintptr_t*>(active) != kCameraDefinitionVtable) {
+    if (!g_config.enabled) {
+        call_original(); return;
+    }
+    if (!IsMemory(active, 0x2C) || *reinterpret_cast<uintptr_t*>(active) != kCameraDefinitionVtable) {
         call_original(); return;
     }
 
@@ -496,10 +522,12 @@ void __fastcall CameraUpdateHook(void* active_ptr, void*, float dt)
     std::uint8_t* manager = nullptr;
     if (!ResolveDevice(controller, device, slot, manager)) { ResetState(controller); call_original(); return; }
     OrbitState& state = GetState(controller);
-    if (state.active != active_ptr || state.device != device || state.config_generation != g_config.generation) {
+    if (state.active != active_ptr || state.device != device || state.renderer_camera != renderer_camera ||
+        state.config_generation != g_config.generation) {
         state.stick_active = false;
         state.active = active_ptr;
         state.device = device;
+        state.renderer_camera = renderer_camera;
         state.config_generation = g_config.generation;
     }
     state.last_tick = GetTickCount();
@@ -522,62 +550,122 @@ void __fastcall CameraUpdateHook(void* active_ptr, void*, float dt)
     if (!state.stick_active) {
         call_original(); return;
     }
-    MatrixScope scope(context, StickTargetYaw(x, y));
+
+    void* composite = *reinterpret_cast<void**>(active + 0x20);
+    if (!IsMemory(composite, sizeof(uintptr_t)) || *reinterpret_cast<uintptr_t*>(composite) != kCompositeVtable) {
+        call_original(); return;
+    }
+    const float yaw = StickTargetYaw(x, y);
+    if (!Finite(yaw)) { call_original(); return; }
+    const OrbitTls previous_tls = g_orbit_tls;
+    g_orbit_tls.active = true;
+    g_orbit_tls.controller = controller;
+    g_orbit_tls.active_definition = active_ptr;
+    g_orbit_tls.composite = composite;
+    g_orbit_tls.yaw = yaw;
     call_original();
+    g_orbit_tls = previous_tls;
 }
 
 bool RunSelfTests()
 {
-    float matrix[16]{};
-    matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
-    float rotated[16]{};
-    RotateMatrix(matrix, rotated, kPi * 0.5f);
-    if (std::fabs(rotated[0]) > 0.001f || std::fabs(rotated[2] + 1.0f) > 0.001f ||
-        std::fabs(rotated[8] - 1.0f) > 0.001f || std::fabs(rotated[5] - 1.0f) > 0.001f) return false;
+    float position[3] = {0.0f, 3.0f, -10.0f};
+    const float origin[3] = {100.0f, 0.0f, 200.0f};
+    const float target[3] = {100.0f, 1.0f, 200.0f};
+    RotatePositionOffsetAroundWorldTarget(position, origin, target, kPi * 0.5f);
+    if (std::fabs(position[0] - 10.0f) > 0.001f || std::fabs(position[1] - 3.0f) > 0.001f ||
+        std::fabs(position[2]) > 0.001f) return false;
+    position[0] = 0.0f;
+    position[2] = -10.0f;
+    RotatePositionOffsetAroundWorldTarget(position, origin, target, kPi);
+    if (std::fabs(position[0]) > 0.001f || std::fabs(position[2] - 10.0f) > 0.001f) return false;
     if (std::fabs(StickTargetYaw(1.0f, 0.0f) - kPi * 0.5f) > 0.001f ||
         std::fabs(std::fabs(StickTargetYaw(0.0f, 1.0f)) - kPi) > 0.001f ||
         std::fabs(StickTargetYaw(0.0f, -1.0f)) > 0.001f) return false;
     return true;
 }
 
+bool RestorePointHook()
+{
+    if (!g_point_hook_installed.exchange(false)) return true;
+    const std::uint8_t original[] = {0x8B, 0x15, 0x10, 0x84, 0x8E, 0x00};
+    auto* site = reinterpret_cast<std::uint8_t*>(kOrbitPointHookSite);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(site, sizeof(original), PAGE_EXECUTE_READWRITE, &old_protect)) return false;
+    std::memcpy(site, original, sizeof(original));
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(original));
+    DWORD ignored = 0;
+    VirtualProtect(site, sizeof(original), old_protect, &ignored);
+    return std::memcmp(site, original, sizeof(original)) == 0;
+}
+
 bool InstallHook()
 {
     const uintptr_t expected[5] = {0x004CDE80, 0x004CE040, 0x004CDE20, 0x004CE210, 0x004CDF90};
+    const std::uint8_t point_expected[] = {
+        0x8B, 0x15, 0x10, 0x84, 0x8E, 0x00, 0x83, 0xBA, 0xAC, 0x04, 0x00, 0x00, 0x02
+    };
     auto* table = reinterpret_cast<uintptr_t*>(kCameraDefinitionVtable);
-    if (!IsMemory(table, sizeof(expected)) || std::memcmp(table, expected, sizeof(expected)) != 0) {
-        Log("OrbitCamera: unsupported executable camera vtable signature; hook not installed");
+    if (!IsMemory(table, sizeof(expected)) || std::memcmp(table, expected, sizeof(expected)) != 0 ||
+        !IsMemory(reinterpret_cast<void*>(kOrbitPointHookSite), sizeof(point_expected)) ||
+        std::memcmp(reinterpret_cast<void*>(kOrbitPointHookSite), point_expected, sizeof(point_expected)) != 0) {
+        Log("OrbitCamera: unsupported executable camera signature; hooks not installed");
         return false;
     }
+
+    auto* point_site = reinterpret_cast<std::uint8_t*>(kOrbitPointHookSite);
+    std::uint8_t point_patch[6] = {0xE8, 0, 0, 0, 0, 0x90};
+    const auto displacement = static_cast<std::int32_t>(
+        reinterpret_cast<uintptr_t>(&OrbitDesiredPointHook) - (kOrbitPointHookSite + 5));
+    std::memcpy(point_patch + 1, &displacement, sizeof(displacement));
+    DWORD point_protect = 0;
+    if (!VirtualProtect(point_site, sizeof(point_patch), PAGE_EXECUTE_READWRITE, &point_protect)) return false;
+    std::memcpy(point_site, point_patch, sizeof(point_patch));
+    FlushInstructionCache(GetCurrentProcess(), point_site, sizeof(point_patch));
+    DWORD ignored = 0;
+    VirtualProtect(point_site, sizeof(point_patch), point_protect, &ignored);
+    g_point_hook_installed.store(true);
+    if (std::memcmp(point_site, point_patch, sizeof(point_patch)) != 0) {
+        RestorePointHook();
+        Log("OrbitCamera: desired-position hook write failed");
+        return false;
+    }
+
     DWORD old_protect = 0;
     auto* slot = reinterpret_cast<void**>(kCameraUpdateSlot);
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect)) return false;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        RestorePointHook();
+        return false;
+    }
     g_original = reinterpret_cast<CameraUpdateFn>(InterlockedExchangePointer(slot, reinterpret_cast<void*>(&CameraUpdateHook)));
     FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
-    DWORD ignored = 0;
     VirtualProtect(slot, sizeof(void*), old_protect, &ignored);
     if (reinterpret_cast<uintptr_t>(g_original) != kExpectedUpdate) {
         DWORD restore = 0;
         VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &restore);
         InterlockedCompareExchangePointer(slot, reinterpret_cast<void*>(g_original), reinterpret_cast<void*>(&CameraUpdateHook));
         VirtualProtect(slot, sizeof(void*), restore, &ignored);
+        RestorePointHook();
         Log("OrbitCamera: camera update slot was already modified; hook not installed");
         return false;
     }
     g_installed.store(true);
-    Log("OrbitCamera: installed chase-camera matrix hook source=%d", static_cast<int>(g_config.source));
+    Log("OrbitCamera: installed chase-camera desired-position hook source=%d", static_cast<int>(g_config.source));
     return true;
 }
 
 void UninstallHook()
 {
-    if (!g_installed.exchange(false)) return;
-    auto* slot = reinterpret_cast<void**>(kCameraUpdateSlot);
-    DWORD old_protect = 0;
-    if (VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect)) {
-        InterlockedCompareExchangePointer(slot, reinterpret_cast<void*>(g_original), reinterpret_cast<void*>(&CameraUpdateHook));
-        DWORD ignored = 0;
-        VirtualProtect(slot, sizeof(void*), old_protect, &ignored);
+    if (g_installed.exchange(false)) {
+        auto* slot = reinterpret_cast<void**>(kCameraUpdateSlot);
+        DWORD old_protect = 0;
+        if (VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect)) {
+            InterlockedCompareExchangePointer(slot, reinterpret_cast<void*>(g_original), reinterpret_cast<void*>(&CameraUpdateHook));
+            DWORD ignored = 0;
+            VirtualProtect(slot, sizeof(void*), old_protect, &ignored);
+        }
     }
+    RestorePointHook();
 }
 
 DWORD WINAPI InitThread(LPVOID)

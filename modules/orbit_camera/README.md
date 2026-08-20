@@ -1,6 +1,6 @@
 # FO2 Orbit Camera
 
-`FO2 Orbit Camera` is a 32-bit ASI plugin for the Steam version of `FlatOut 2`. It adds an absolute right-stick orbit view to the active chase camera while preserving the game's native tracking, collision avoidance, field of view, and shake pipeline.
+`FO2 Orbit Camera` is a 32-bit ASI plugin for the Steam version of `FlatOut 2`. It adds an absolute right-stick orbit view to the active chase camera while retaining the game's native chase tracking, field of view, and shake as the base camera.
 
 ## Install
 
@@ -22,7 +22,7 @@ The right stick selects an absolute camera angle rather than accumulating rotati
 - left: left-side view (`-90` degrees)
 - diagonals: intermediate angles
 
-The plugin keeps independent orbit state for each controller and resets state when camera ownership, device assignment, configuration, or chase-camera eligibility changes. Stick direction is applied immediately with no easing or speed cap; holding left or right selects a fixed side view and never keeps rotating the camera.
+The plugin keeps independent orbit state for each controller and resets state when camera ownership, device assignment, configuration, or chase-camera eligibility changes. After chase tracking, it converts the native camera offset to world space, rotates it around the native look target, and converts it back before collision handling. The game then builds the final camera pose, FOV, shake, and renderer matrices normally. Stick direction therefore snaps immediately with no downstream tracker interpolation, easing, or speed cap; holding left or right selects a fixed side view and never keeps rotating the camera.
 
 Right-stick input is capability-gated. Automatic input prefers the assigned SDL gamepad with the verified Zoom Platform build, falls back to the game's validated native DirectInput state for stock pads, and uses the split-screen adapter's validated state for player four. Unknown devices or invalid state leave the native camera unchanged.
 
