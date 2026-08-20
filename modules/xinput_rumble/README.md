@@ -2,6 +2,8 @@
 
 Experimental `dinput8.dll` proxy for `FlatOut 2` that adds XInput controller rumble from gameplay events.
 
+The module has one configured XInput output. It does not route rumble by split-screen player. In a split race, contact or damage from any local car can rumble that controller.
+
 The PC executable contains old force-feedback plumbing, but testing did not produce reliable rumble events with an XInput controller during races. This proxy forwards normal DirectInput calls to Windows and adds XInput rumble from observed car events.
 
 Current best build:

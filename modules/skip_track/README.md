@@ -2,7 +2,7 @@
 
 `FO2 Skip Track` is a small ASI plugin for `FlatOut 2` that skips the current music track from a single button press.
 
-## Quick Start
+## Quick start
 
 1. Download the latest release zip from this repo.
 2. Extract `fo2_skip_track.asi`, `fo2_skip_track.ini`, and `winmm.dll` into your `FlatOut 2` folder next to `FlatOut2.exe`.
@@ -19,7 +19,7 @@ It supports:
 - keyboard trigger with `N` by default
 - direct XInput controller trigger with `LEFT_SHOULDER` by default
 
-## What It Does
+## What it does
 
 The plugin hooks into the running game process, calls native music control functions discovered in the `FlatOut2.exe` binary, and exposes that behavior through a configurable hotkey and controller binding.
 
@@ -96,7 +96,7 @@ Supported names:
 - The bundled `winmm.dll` is a pinned known-good Ultimate ASI Loader build. Newer loader builds caused crashes in local `FlatOut 2` testing.
 - Function RVAs are currently hardcoded for the tested executable build. If the game executable changes, those addresses may need updating.
 
-## Building From Source
+## Building from source
 
 Files:
 

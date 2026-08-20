@@ -1,13 +1,13 @@
 # FlatOut 2 Mods
 
-Runtime mods for `FlatOut 2`, tested on the Steam version.
+Runtime mods for the current Steam version of `FlatOut 2`.
 
-Fully vibecoded, rigorously tested.
+The hooks use exact executable signatures. Experimental features are marked below.
 
 ## Mods
 
 - `fo2_orbit_camera`: instant right-stick orbit control for the chase camera. Other camera modes stay untouched.
-- `fo2_zpatch_reimpl`: widescreen/FOV fixes, license and intro skips, FPS unlock, frame pacing fix, v-sync removal, borderless windowed mode.
+- `fo2_zpatch_reimpl`: widescreen and FOV fixes, startup skips, frame pacing changes, local split screen, and optional menu-car limit patches.
 - `fo2_xinput_rumble`: XInput controller rumble with directional feedback and gameplay-event rumble.
 - `fo2_skip_track`: music track skip from keyboard or controller.
 
@@ -75,6 +75,10 @@ WidescreenFix_FOVScaling=1
 SplitscreenFix=0
 SplitscreenPostProcessingFix=0
 SplitscreenZoomInputFix=1
+MenuCarBackfaceCulling=0
+MenuCarMaxModelFileSize=524288
+MenuCarMaxSkinFileSize=2097152
+MenuCarMaxSurfaces=16
 ```
 
 Feature notes:
@@ -86,10 +90,15 @@ Feature notes:
 - `RemoveVSync` requests immediate D3D9 presentation.
 - `BorderlessWindowed` is available but disabled by default.
 - `WidescreenFix` and `WidescreenFix_FOVScaling` fix ultrawide/widescreen menu, garage, and race camera behavior.
-- `SplitscreenFix` is an opt-in two-, three-, or capability-gated four-player prototype. The party roster includes indexed input-device selectors and stores one distinct zero-based keyboard/pad index per player. Three players use the stock keyboard-plus-two-pad topology and the top-left, top-right, and bottom-left quadrants of a fixed 2x2 grid. Four players require all three pads to be connected before startup: an XInput-backed slot 3 is then installed transactionally alongside the stock keyboard and two stock pads, and the native four-quadrant grid is exposed. Four-pad/no-keyboard play is not supported.
+- `SplitscreenFix` is an opt-in local multiplayer prototype for two, three, or four players. The party screen assigns one distinct input device to each player.
+- Three players use keyboard plus two pads. Their viewports occupy the top-left, top-right, and bottom-left cells of a 2x2 grid.
+- Four players require keyboard plus three pads. The third pad must appear as XInput user 2 when the input manager starts. If that adapter does not install, the menu stays capped at three players. Four-pad play without a keyboard is not supported.
 - Split orientation is selected at runtime from the split-screen party setup and persisted by the ASI in `fo2_splitscreen_layout.lua`. `Vertical` uses left/right viewports and `Horizontal` uses top/bottom viewports; missing or invalid state defaults to `Horizontal`, which is also the safe fallback if native layout support cannot be installed. BED scripts never load the state file directly; a native `Input` query reports the authoritative active layout and capability.
 - `SplitscreenPostProcessingFix` is a separate experimental opt-in. It performs the shared post-process once with a full-device viewport and restores the final player viewport afterward; leave it off if a shader shows seams or edge artifacts.
 - `SplitscreenZoomInputFix` is version- and capability-gated Zoom Platform compatibility. For the verified Zoom build it translates Zoom-synthesized Return back to the originating pad slot during split ready prompts without suppressing the input. Unknown/no-Zoom installations keep the core split fix unchanged.
+- `MenuCarMaxModelFileSize` and `MenuCarMaxSkinFileSize` raise the menu preview input allocations. Their defaults match the stock game.
+- `MenuCarBackfaceCulling` enables counter-clockwise culling for the menu car. It is off by default.
+- `MenuCarMaxSurfaces` replaces the fixed material and surface tables with bounded storage. Stock is `16`. Keep that default unless a menu model needs more records.
 
 ## `fo2_xinput_rumble`
 
@@ -114,6 +123,8 @@ It supports:
 - configurable strength, duration, cooldown, envelopes, and synthetic button-test rumble
 
 The default config is tuned for an Xbox-style controller on controller index `0`.
+
+The rumble module has one output channel. In split screen, events from any local player can currently reach that configured controller. Per-player rumble routing is not implemented.
 
 ## `fo2_skip_track`
 
