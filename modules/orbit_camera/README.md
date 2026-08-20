@@ -1,6 +1,6 @@
 # FO2 Orbit Camera
 
-`FO2 Orbit Camera` is a 32-bit ASI plugin for the Steam version of `FlatOut 2`. It adds an absolute right-stick orbit view to the active chase camera while retaining the game's native chase tracking, field of view, and shake as the base camera.
+`FO2 Orbit Camera` is a 32-bit ASI plugin for the Steam version of `FlatOut 2`. It adds instant right-stick orbit control to the stock chase camera. It does not change any other camera mode.
 
 ## Install
 
@@ -14,21 +14,23 @@ The repository's top-level build and install scripts package and install all thr
 
 ## Input and camera behavior
 
-The right stick selects an absolute camera angle rather than accumulating rotation:
+The right stick selects an absolute chase-camera angle:
 
-- idle or up: native rear chase direction (`0` degrees)
-- right: right-side view (`+90` degrees)
-- down (pull back): look-back view (`180` degrees)
-- left: left-side view (`-90` degrees)
+- idle or forward: native chase direction at `0` degrees
+- right: right-side view at `+90` degrees
+- back, by pulling the stick down: rear-facing view at `180` degrees
+- left: left-side view at `-90` degrees
 - diagonals: intermediate angles
 
-The plugin keeps independent orbit state for each controller and resets state when camera ownership, device assignment, configuration, or chase-camera eligibility changes. After chase tracking, it converts the native camera offset to world space, rotates it around the native look target, and converts it back before collision handling. The game then builds the final camera pose, FOV, shake, and renderer matrices normally. Stick direction therefore snaps immediately with no downstream tracker interpolation, easing, or speed cap; holding left or right selects a fixed side view and never keeps rotating the camera.
+The camera snaps directly to the selected angle. It does not accumulate rotation, ease toward the target, or apply a speed limit. Holding left or right keeps a fixed side view. Releasing the stick returns control to the native chase camera.
 
-Right-stick input is capability-gated. Automatic input prefers the assigned SDL gamepad with the verified Zoom Platform build, falls back to the game's validated native DirectInput state for stock pads, and uses the split-screen adapter's validated state for player four. Unknown devices or invalid state leave the native camera unchanged.
+The plugin keeps separate input state for each local player. It rotates the native chase-camera offset before the game handles collision, field of view, and shake. Cockpit, hood, bumper, replay, crash, and other camera modes stay untouched.
 
-See `fo2_orbit_camera.ini` for the shipped defaults and configurable deadzones, response curve, and axis inversion options.
+`Source=Auto` reads the assigned SDL gamepad when the verified Zoom Platform build is present. Otherwise it reads the game's DirectInput state for stock pads or the split-screen adapter state for player four. If the plugin cannot identify the assigned device, it leaves the camera alone.
 
-`Source=Auto` is recommended. `Source=ZoomSDL` requires the verified Zoom/SDL build and otherwise leaves the stock camera untouched. `Source=Native` uses only validated native DirectInput state (and the validated player-four adapter). The radial `AxisCurveExponent` changes engagement response without changing the absolute stick direction.
+See `fo2_orbit_camera.ini` for the deadzone, radial response curve, axis inversion, and input-source settings.
+
+`Source=Auto` is the default. `Source=ZoomSDL` requires the verified Zoom/SDL build. `Source=Native` reads only native DirectInput state and the player-four adapter. `AxisCurveExponent` changes how far the stick must move without changing the selected angle.
 
 ## Building from source
 

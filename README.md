@@ -6,7 +6,7 @@ Fully vibecoded, rigorously tested.
 
 ## Mods
 
-- `fo2_orbit_camera`: absolute right-stick orbit camera for the active chase-camera pipeline, with per-player state, deadzones, response tuning, smoothing, and automatic return.
+- `fo2_orbit_camera`: instant right-stick orbit control for the chase camera. Other camera modes stay untouched.
 - `fo2_zpatch_reimpl`: widescreen/FOV fixes, license and intro skips, FPS unlock, frame pacing fix, v-sync removal, borderless windowed mode.
 - `fo2_xinput_rumble`: XInput controller rumble with directional feedback and gameplay-event rumble.
 - `fo2_skip_track`: music track skip from keyboard or controller.
@@ -33,11 +33,21 @@ Install files:
 - `fo2_orbit_camera.ini`
 - `winmm.dll`
 
-The mod adds an absolute orbit view to the stock chase camera. Right-stick down, or an idle stick, keeps the native rear chase direction; right and left select the corresponding side views; up selects a look-back view; and diagonals select intermediate angles. It retains the native chase camera's tracking, collision avoidance, field of view, and shake behavior.
+The mod controls only the stock chase camera. Cockpit, hood, bumper, replay, crash, and other camera modes stay untouched.
 
-Orbit state is maintained independently for each controller. Engagement and return deadzones, response curve, smoothing times, angular speed limit, and axis inversion are configurable in `fo2_orbit_camera.ini`.
+The right stick selects an absolute chase-camera angle:
 
-Right-stick input is capability-gated. Automatic mode prefers the assigned SDL gamepad with the verified Zoom Platform build, then falls back to validated native DirectInput state for stock pads or the validated player-four adapter state. Unknown devices safely retain the native camera behavior.
+- idle or forward: native chase view
+- right: right-side view
+- back: rear-facing view
+- left: left-side view
+- diagonals: intermediate angles
+
+The camera snaps directly to the selected angle. It does not accumulate rotation, ease toward the target, or apply a speed limit. Releasing the stick returns control to the native chase camera.
+
+The mod keeps separate input state for each local player. It rotates the native chase-camera offset before the game handles collision, field of view, and shake. `fo2_orbit_camera.ini` controls the deadzone, radial response curve, axis inversion, and input source.
+
+`Source=Auto` reads the assigned SDL gamepad when the verified Zoom Platform build is present. Otherwise it reads the game's DirectInput state for stock pads or the split-screen adapter state for player four. If the plugin cannot identify the assigned device, it leaves the camera alone.
 
 ## `fo2_zpatch_reimpl`
 
