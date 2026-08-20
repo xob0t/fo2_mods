@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <cmath>
 
 namespace {
@@ -35,9 +36,10 @@ bool g_splitscreen_four_player_capable = false;
 bool g_splitscreen_vertical_render_active = false;
 bool g_splitscreen_vertical_hud_pass_active = false;
 bool g_splitscreen_grid_hud_pass_active = false;
-bool g_menu_car_backface_culling = true;
+bool g_menu_car_backface_culling = false;
 DWORD g_menu_car_max_model_file_size = 524288;
 DWORD g_menu_car_max_skin_file_size = 2097152;
+DWORD g_menu_car_max_surfaces = 16;
 char g_log_path[MAX_PATH] = {};
 char g_splitscreen_layout_state_path[MAX_PATH] = {};
 char g_splitscreen_filesystem_name[] = "fo2_splitscreen_filesystem";
@@ -323,9 +325,14 @@ void LoadConfig()
     if (g_splitscreen_fix) {
         LoadSplitscreenLayoutState();
     }
-    g_menu_car_backface_culling = GetPrivateProfileIntA("Fixes", "MenuCarBackfaceCulling", 1, ini_path) != 0;
+    g_menu_car_backface_culling = GetPrivateProfileIntA("Fixes", "MenuCarBackfaceCulling", 0, ini_path) != 0;
     g_menu_car_max_model_file_size = std::max<DWORD>(GetPrivateProfileIntA("Fixes", "MenuCarMaxModelFileSize", 524288, ini_path), 1);
     g_menu_car_max_skin_file_size = std::max<DWORD>(GetPrivateProfileIntA("Fixes", "MenuCarMaxSkinFileSize", 2097152, ini_path), 1);
+    g_menu_car_max_surfaces = std::clamp<DWORD>(
+        GetPrivateProfileIntA("Fixes", "MenuCarMaxSurfaces", 16, ini_path),
+        1,
+        4096
+    );
 }
 
 bool IsWritableMemory(const void* address, size_t size)
@@ -1140,6 +1147,799 @@ __declspec(naked) void MenuTransformHeightHook533690()
     }
 }
 
+void EnableMenuCarBackfaceCulling()
+{
+    // ZPatchFO2 v2.4 stores 0x008DA788 in its own pointer-to-slot global,
+    // dereferences that slot exactly once, and invokes vtable offset 0xE4
+    // (IDirect3DDevice9::SetRenderState) on the resulting interface. The
+    // previous reimplementation dereferenced the interface a second time,
+    // mistaking its vtable pointer for the object and crashing on dispatch.
+    auto* device = *reinterpret_cast<IDirect3DDevice9**>(0x008DA788);
+    if (device == nullptr) {
+        return;
+    }
+
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
+}
+
+__declspec(naked) void MenuCarBackfaceCullingHook5AACB0()
+{
+    __asm {
+        pushfd
+        pushad
+        call EnableMenuCarBackfaceCulling
+        popad
+        popfd
+
+        // Replay the seven bytes overwritten at 0x005AACB0.
+        mov eax, dword ptr [ecx]
+        push 3
+        call dword ptr [eax + 0x5C]
+
+        mov eax, 0x005AACB7
+        jmp eax
+    }
+}
+
+constexpr DWORD kVanillaMenuCarSurfaceCapacity = 16;
+constexpr DWORD kMenuCarSurfaceRecordBytes = 0x34;
+constexpr DWORD kMenuCarSurfaceArrayOffset = 0xA20;
+constexpr DWORD kVanillaMenuCarMaterialCapacity = 16;
+constexpr DWORD kMenuCarMaterialRecordBytes = 0xA0;
+constexpr DWORD kMenuCarMaterialArrayOffset = 0x20;
+constexpr DWORD kMenuCarObjectBytes = 0xEE0;
+constexpr DWORD kMenuCarNestedResourceOffset = 0xDA0;
+
+struct MenuCarSurfaceStorage
+{
+    void* owner;
+    std::uint8_t* materials;
+    std::uint8_t* records;
+    DWORD material_retained_count;
+    DWORD retained_count;
+    bool material_reference_clamp_logged;
+    bool reference_clamp_logged;
+    bool parse_check_logged;
+    bool resource_link_guard_logged;
+    MenuCarSurfaceStorage* next;
+};
+
+MenuCarSurfaceStorage* g_menu_car_surface_storage = nullptr;
+bool g_menu_car_surface_hooks_installed = false;
+bool g_menu_car_static_reference_coverage_verified = false;
+thread_local MenuCarSurfaceStorage* g_current_menu_car_surface_storage = nullptr;
+thread_local void* g_current_menu_car_surface_owner = nullptr;
+thread_local DWORD g_current_menu_car_serialized_surface_count = 0;
+alignas(DWORD) thread_local std::uint8_t g_menu_car_surface_scratch[kMenuCarSurfaceRecordBytes] = {};
+alignas(DWORD) thread_local std::uint8_t g_menu_car_material_scratch[kMenuCarMaterialRecordBytes] = {};
+thread_local bool g_menu_car_material_scratch_initialized = false;
+
+void MenuCarMaterialBeginHook4A4DFF();
+void MenuCarMaterialLoopHook4A4E1F();
+void MenuCarMaterialLinkHook4A537C();
+void MenuCarSurfaceBeginHook4A535B();
+void MenuCarSurfaceLoopHook4A536F();
+void MenuCarSurfaceReaderHook4A5604();
+void MenuCarParseEndHook4A57CB();
+void MenuCarResourceTraversalGuardHook54D0D4();
+void FormatBytes(const std::uint8_t* bytes, size_t size, char* output, size_t output_size);
+
+void InitializeMenuCarMaterialRecord(std::uint8_t* record, bool preserve_string)
+{
+    std::uint8_t saved_string[0x1C] = {};
+    if (preserve_string) {
+        std::memcpy(saved_string, record + 0x6C, sizeof(saved_string));
+    }
+
+    std::memset(record, 0, kMenuCarMaterialRecordBytes);
+    *reinterpret_cast<DWORD*>(record + 0x18) = 8;
+    for (DWORD offset = 0x20; offset <= 0x2C; offset += sizeof(DWORD)) {
+        *reinterpret_cast<DWORD*>(record + offset) = 0x3F800000;
+    }
+    for (DWORD offset = 0x50; offset <= 0x5C; offset += sizeof(DWORD)) {
+        *reinterpret_cast<DWORD*>(record + offset) = 0x3F800000;
+    }
+    *reinterpret_cast<DWORD*>(record + 0x64) = 0xFFFFFFFF;
+    *reinterpret_cast<DWORD*>(record + 0x8C) = 15;
+
+    if (preserve_string) {
+        std::memcpy(record + 0x6C, saved_string, sizeof(saved_string));
+    } else {
+        *reinterpret_cast<DWORD*>(record + 0x80) = 0;
+        *reinterpret_cast<DWORD*>(record + 0x84) = 15;
+    }
+}
+
+void InitializeMenuCarSurfaceRecord(std::uint8_t* record)
+{
+    std::memset(record, 0, kMenuCarSurfaceRecordBytes);
+    *reinterpret_cast<DWORD*>(record + 0x08) = 0x00000300;
+    *reinterpret_cast<DWORD*>(record + 0x14) = 4;
+}
+
+MenuCarSurfaceStorage* FindMenuCarSurfaceStorage(void* owner)
+{
+    for (MenuCarSurfaceStorage* storage = g_menu_car_surface_storage; storage != nullptr; storage = storage->next) {
+        if (storage->owner == owner) {
+            return storage;
+        }
+    }
+    return nullptr;
+}
+
+std::uint8_t* EmbeddedMenuCarSurfaceRecord(void* owner, DWORD index)
+{
+    return static_cast<std::uint8_t*>(owner) + kMenuCarSurfaceArrayOffset + index * kMenuCarSurfaceRecordBytes;
+}
+
+std::uint8_t* EmbeddedMenuCarMaterialRecord(void* owner, DWORD index)
+{
+    return static_cast<std::uint8_t*>(owner) + kMenuCarMaterialArrayOffset + index * kMenuCarMaterialRecordBytes;
+}
+
+MenuCarSurfaceStorage* GetOrCreateMenuCarSurfaceStorage(void* owner)
+{
+    MenuCarSurfaceStorage* storage = FindMenuCarSurfaceStorage(owner);
+    if (storage != nullptr) {
+        return storage;
+    }
+
+    storage = static_cast<MenuCarSurfaceStorage*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MenuCarSurfaceStorage))
+    );
+    if (storage != nullptr) {
+        storage->owner = owner;
+        storage->next = g_menu_car_surface_storage;
+        g_menu_car_surface_storage = storage;
+    } else {
+        Log(
+            "MenuCarMaxSurfaces: storage metadata allocation failed for object=0x%p; using bounded scratch fallback",
+            owner
+        );
+    }
+    return storage;
+}
+
+std::uint8_t* SelectCurrentMenuCarMaterialRecord(DWORD index)
+{
+    if (index < g_menu_car_max_surfaces) {
+        if (g_current_menu_car_surface_storage != nullptr &&
+            g_current_menu_car_surface_storage->materials != nullptr) {
+            return g_current_menu_car_surface_storage->materials + index * kMenuCarMaterialRecordBytes;
+        }
+        if (g_current_menu_car_surface_owner != nullptr && index < kVanillaMenuCarMaterialCapacity) {
+            return EmbeddedMenuCarMaterialRecord(g_current_menu_car_surface_owner, index);
+        }
+    }
+
+    InitializeMenuCarMaterialRecord(
+        g_menu_car_material_scratch,
+        g_menu_car_material_scratch_initialized
+    );
+    g_menu_car_material_scratch_initialized = true;
+    return g_menu_car_material_scratch;
+}
+
+std::uint8_t* __cdecl BeginMenuCarMaterialParse(void* owner, DWORD serialized_count)
+{
+    MenuCarSurfaceStorage* storage = GetOrCreateMenuCarSurfaceStorage(owner);
+    if (storage != nullptr && storage->materials == nullptr) {
+        const SIZE_T allocation_bytes =
+            static_cast<SIZE_T>(g_menu_car_max_surfaces) * kMenuCarMaterialRecordBytes;
+        storage->materials = static_cast<std::uint8_t*>(
+            HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, allocation_bytes)
+        );
+        if (storage->materials != nullptr) {
+            for (DWORD index = 0; index < g_menu_car_max_surfaces; ++index) {
+                InitializeMenuCarMaterialRecord(
+                    storage->materials + index * kMenuCarMaterialRecordBytes,
+                    false
+                );
+            }
+            Log(
+                "MenuCarMaxSurfaces: allocated %lu material records (%lu bytes) for object=0x%p",
+                static_cast<unsigned long>(g_menu_car_max_surfaces),
+                static_cast<unsigned long>(allocation_bytes),
+                owner
+            );
+        } else {
+            Log(
+                "MenuCarMaxSurfaces: material allocation failed for object=0x%p; retaining at most %lu embedded materials",
+                owner,
+                static_cast<unsigned long>(std::min<DWORD>(g_menu_car_max_surfaces, kVanillaMenuCarMaterialCapacity))
+            );
+        }
+    } else if (storage != nullptr && storage->materials != nullptr) {
+        for (DWORD index = 0; index < g_menu_car_max_surfaces; ++index) {
+            InitializeMenuCarMaterialRecord(
+                storage->materials + index * kMenuCarMaterialRecordBytes,
+                true
+            );
+        }
+    }
+
+    g_current_menu_car_surface_storage = storage;
+    g_current_menu_car_surface_owner = owner;
+
+    const DWORD available_capacity = storage != nullptr && storage->materials != nullptr
+        ? g_menu_car_max_surfaces
+        : std::min<DWORD>(g_menu_car_max_surfaces, kVanillaMenuCarMaterialCapacity);
+    const DWORD retained_count = std::min<DWORD>(serialized_count, available_capacity);
+    if (storage != nullptr) {
+        storage->material_retained_count = retained_count;
+        storage->material_reference_clamp_logged = false;
+        storage->parse_check_logged = false;
+        storage->resource_link_guard_logged = false;
+    }
+
+    // +0x08 is the stock material count. Clamp it to storage that is actually
+    // addressable so no later count consumer can walk beyond retained data.
+    *reinterpret_cast<DWORD*>(static_cast<std::uint8_t*>(owner) + 0x08) = retained_count;
+
+    if (serialized_count > available_capacity) {
+        Log(
+            "MenuCarMaxSurfaces: object=0x%p declares %lu materials; retaining %lu and safely discarding %lu",
+            owner,
+            static_cast<unsigned long>(serialized_count),
+            static_cast<unsigned long>(retained_count),
+            static_cast<unsigned long>(serialized_count - retained_count)
+        );
+    }
+    return SelectCurrentMenuCarMaterialRecord(0);
+}
+
+std::uint8_t* __cdecl SelectMenuCarMaterialParseDestination(DWORD index)
+{
+    return SelectCurrentMenuCarMaterialRecord(index);
+}
+
+std::uint8_t* __cdecl ResolveMenuCarMaterialRecord(void* owner, DWORD index)
+{
+    MenuCarSurfaceStorage* storage = FindMenuCarSurfaceStorage(owner);
+    if (storage == nullptr || storage->material_retained_count == 0) {
+        InitializeMenuCarMaterialRecord(
+            g_menu_car_material_scratch,
+            g_menu_car_material_scratch_initialized
+        );
+        g_menu_car_material_scratch_initialized = true;
+        return g_menu_car_material_scratch;
+    }
+
+    if (index >= storage->material_retained_count) {
+        if (!storage->material_reference_clamp_logged) {
+            Log(
+                "MenuCarMaxSurfaces: object=0x%p surface material reference %lu exceeds retained material count %lu; clamping",
+                owner,
+                static_cast<unsigned long>(index),
+                static_cast<unsigned long>(storage->material_retained_count)
+            );
+            storage->material_reference_clamp_logged = true;
+        }
+        index = storage->material_retained_count - 1;
+    }
+
+    if (storage->materials != nullptr) {
+        return storage->materials + index * kMenuCarMaterialRecordBytes;
+    }
+    return EmbeddedMenuCarMaterialRecord(owner, index);
+}
+
+std::uint8_t* SelectCurrentMenuCarSurfaceRecord(DWORD remaining_count)
+{
+    DWORD index = 0;
+    if (remaining_count <= g_current_menu_car_serialized_surface_count) {
+        index = g_current_menu_car_serialized_surface_count - remaining_count;
+    }
+
+    if (index < g_menu_car_max_surfaces) {
+        if (g_current_menu_car_surface_storage != nullptr &&
+            g_current_menu_car_surface_storage->records != nullptr) {
+            return g_current_menu_car_surface_storage->records + index * kMenuCarSurfaceRecordBytes;
+        }
+        if (g_current_menu_car_surface_owner != nullptr && index < kVanillaMenuCarSurfaceCapacity) {
+            return EmbeddedMenuCarSurfaceRecord(g_current_menu_car_surface_owner, index);
+        }
+    }
+
+    // The parser must still consume every variable-length serialized surface
+    // or the following BMOD/MESH records become misaligned. A freshly reset
+    // scratch record safely absorbs each configured-capacity overflow record.
+    InitializeMenuCarSurfaceRecord(g_menu_car_surface_scratch);
+    return g_menu_car_surface_scratch;
+}
+
+std::uint8_t* __cdecl BeginMenuCarSurfaceParse(void* owner, DWORD serialized_count)
+{
+    MenuCarSurfaceStorage* storage = GetOrCreateMenuCarSurfaceStorage(owner);
+
+    if (storage != nullptr && storage->records == nullptr) {
+        const SIZE_T allocation_bytes =
+            static_cast<SIZE_T>(g_menu_car_max_surfaces) * kMenuCarSurfaceRecordBytes;
+        storage->records = static_cast<std::uint8_t*>(
+            HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, allocation_bytes)
+        );
+        if (storage->records != nullptr) {
+            for (DWORD index = 0; index < g_menu_car_max_surfaces; ++index) {
+                InitializeMenuCarSurfaceRecord(storage->records + index * kMenuCarSurfaceRecordBytes);
+            }
+            Log(
+                "MenuCarMaxSurfaces: allocated %lu records (%lu bytes) for object=0x%p",
+                static_cast<unsigned long>(g_menu_car_max_surfaces),
+                static_cast<unsigned long>(allocation_bytes),
+                owner
+            );
+        } else {
+            Log(
+                "MenuCarMaxSurfaces: allocation failed for object=0x%p; retaining at most %lu embedded records",
+                owner,
+                static_cast<unsigned long>(std::min<DWORD>(g_menu_car_max_surfaces, kVanillaMenuCarSurfaceCapacity))
+            );
+        }
+    } else if (storage != nullptr && storage->records != nullptr) {
+        for (DWORD index = 0; index < g_menu_car_max_surfaces; ++index) {
+            InitializeMenuCarSurfaceRecord(storage->records + index * kMenuCarSurfaceRecordBytes);
+        }
+    }
+
+    if (storage != nullptr) {
+        const DWORD available_capacity = storage->records != nullptr
+            ? g_menu_car_max_surfaces
+            : std::min<DWORD>(g_menu_car_max_surfaces, kVanillaMenuCarSurfaceCapacity);
+        storage->retained_count = std::min<DWORD>(serialized_count, available_capacity);
+        storage->reference_clamp_logged = false;
+        storage->parse_check_logged = false;
+    }
+
+    g_current_menu_car_surface_storage = storage;
+    g_current_menu_car_surface_owner = owner;
+    g_current_menu_car_serialized_surface_count = serialized_count;
+
+    if (serialized_count > g_menu_car_max_surfaces) {
+        Log(
+            "MenuCarMaxSurfaces: object=0x%p declares %lu surfaces; retaining %lu and safely discarding %lu",
+            owner,
+            static_cast<unsigned long>(serialized_count),
+            static_cast<unsigned long>(g_menu_car_max_surfaces),
+            static_cast<unsigned long>(serialized_count - g_menu_car_max_surfaces)
+        );
+    }
+
+    return SelectCurrentMenuCarSurfaceRecord(serialized_count) + 0x0C;
+}
+
+std::uint8_t* __cdecl SelectMenuCarSurfaceParseDestination(DWORD remaining_count)
+{
+    return SelectCurrentMenuCarSurfaceRecord(remaining_count) + 0x0C;
+}
+
+std::uint8_t* __cdecl ResolveMenuCarSurfaceRecord(void* owner, DWORD index)
+{
+    MenuCarSurfaceStorage* storage = FindMenuCarSurfaceStorage(owner);
+    if (storage == nullptr || storage->retained_count == 0) {
+        InitializeMenuCarSurfaceRecord(g_menu_car_surface_scratch);
+        return g_menu_car_surface_scratch;
+    }
+
+    if (index >= storage->retained_count) {
+        if (!storage->reference_clamp_logged) {
+            Log(
+                "MenuCarMaxSurfaces: object=0x%p model surface reference %lu exceeds retained count %lu; clamping",
+                owner,
+                static_cast<unsigned long>(index),
+                static_cast<unsigned long>(storage->retained_count)
+            );
+            storage->reference_clamp_logged = true;
+        }
+        index = storage->retained_count - 1;
+    }
+
+    if (storage->records != nullptr) {
+        return storage->records + index * kMenuCarSurfaceRecordBytes;
+    }
+    return EmbeddedMenuCarSurfaceRecord(owner, index);
+}
+
+bool MenuCarJumpTargets(std::uintptr_t address, const void* target)
+{
+    const auto* site = reinterpret_cast<const std::uint8_t*>(address);
+    if (site[0] != 0xE9) {
+        return false;
+    }
+    std::int32_t displacement = 0;
+    std::memcpy(&displacement, site + 1, sizeof(displacement));
+    return site + 5 + displacement == reinterpret_cast<const std::uint8_t*>(target);
+}
+
+bool VerifyMenuCarStaticReferenceCoverage()
+{
+    struct ReferencePattern
+    {
+        std::uintptr_t address;
+        const std::uint8_t* bytes;
+        size_t size;
+        const char* label;
+    };
+
+    const std::uint8_t material_constructor_base[] = {0x8D, 0x46, 0x20};
+    const std::uint8_t material_constructor_advance_eax[] = {0x05, 0xA0, 0x00, 0x00, 0x00};
+    const std::uint8_t material_constructor_advance_edi[] = {0x81, 0xC7, 0xA0, 0x00, 0x00, 0x00};
+    const std::uint8_t surface_constructor_base[] = {0x8D, 0x86, 0x20, 0x0A, 0x00, 0x00};
+    const std::uint8_t surface_constructor_advance[] = {0x83, 0xC0, 0x34};
+    const std::uint8_t material_destructor_end[] = {0x81, 0xC6, 0xA4, 0x0A, 0x00, 0x00};
+    const std::uint8_t material_destructor_stride[] = {0x81, 0xEE, 0xA0, 0x00, 0x00, 0x00};
+    const std::uint8_t material_parser_advance[] = {0x81, 0xC6, 0xA0, 0x00, 0x00, 0x00};
+    const std::uint8_t surface_parser_advance[] = {0x83, 0xC2, 0x34};
+    const std::uint8_t model_surface_scale[] = {0x6B, 0xC0, 0x34};
+    const std::uint8_t manager_allocation[] = {0x68, 0xD0, 0x1E, 0x00, 0x00};
+    const std::uint8_t owner_stride[] = {0x81, 0xC7, 0xE0, 0x0E, 0x00, 0x00};
+    const std::uint8_t nested_resource_base[] = {0x8D, 0xBE, 0xA0, 0x0D, 0x00, 0x00};
+    const std::uint8_t trailing_name[] = {0x81, 0xC1, 0x6C, 0x0E, 0x00, 0x00};
+
+    const ReferencePattern patterns[] = {
+        {0x004A3F65, material_constructor_base, sizeof(material_constructor_base), "material constructor base +0x20"},
+        {0x004A3F91, material_constructor_advance_eax, sizeof(material_constructor_advance_eax), "material constructor EAX stride 0xA0"},
+        {0x004A3F96, material_constructor_advance_edi, sizeof(material_constructor_advance_edi), "material constructor EDI stride 0xA0"},
+        {0x004A3F9F, surface_constructor_base, sizeof(surface_constructor_base), "surface constructor base +0xA20"},
+        {0x004A3FE9, surface_constructor_advance, sizeof(surface_constructor_advance), "surface constructor stride 0x34"},
+        {0x004A40F1, material_destructor_end, sizeof(material_destructor_end), "material destructor end +0xAA4"},
+        {0x004A4106, material_destructor_stride, sizeof(material_destructor_stride), "material destructor stride 0xA0"},
+        {0x004A509E, material_parser_advance, sizeof(material_parser_advance), "material parser stride 0xA0"},
+        {0x004A54AD, surface_parser_advance, sizeof(surface_parser_advance), "surface parser stride 0x34"},
+        {0x004A55FB, model_surface_scale, sizeof(model_surface_scale), "BMOD surface scale 0x34"},
+        {0x004ABAAA, manager_allocation, sizeof(manager_allocation), "manager allocation 0x1ED0"},
+        {0x004A4177, owner_stride, sizeof(owner_stride), "two-owner stride 0xEE0"},
+        {0x004A4004, nested_resource_base, sizeof(nested_resource_base), "trailing nested resource +0xDA0"},
+        {0x004A56CE, trailing_name, sizeof(trailing_name), "trailing resource name +0xE6C"},
+    };
+
+    for (const ReferencePattern& pattern : patterns) {
+        const auto* address = reinterpret_cast<const std::uint8_t*>(pattern.address);
+        if (std::memcmp(address, pattern.bytes, pattern.size) != 0) {
+            char actual[64] = {};
+            FormatBytes(address, pattern.size, actual, sizeof(actual));
+            Log(
+                "*** WARNING *** MenuCarMaxSurfaces full-exe reference coverage mismatch at 0x%08lX (%s) actual=%s",
+                static_cast<unsigned long>(pattern.address),
+                pattern.label,
+                actual
+            );
+            return false;
+        }
+    }
+
+    Log(
+        "MenuCarMaxSurfaces: full-exe reference coverage verified for 10 array base/stride consumers plus manager allocation=0x1ED0, owner stride=0xEE0, nested resource=+0xDA0, and name=+0xE6C"
+    );
+    return true;
+}
+
+bool MenuCarMemoryRangeHasAccess(const void* address, size_t bytes, bool require_write)
+{
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(address);
+    if (begin < 0x10000 || (begin & (alignof(DWORD) - 1)) != 0 || bytes == 0 ||
+        begin > static_cast<std::uintptr_t>(-1) - bytes) {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION region = {};
+    if (VirtualQuery(address, &region, sizeof(region)) != sizeof(region) ||
+        region.State != MEM_COMMIT || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+
+    const DWORD protection = region.Protect & 0xFF;
+    const bool readable = protection == PAGE_READONLY || protection == PAGE_READWRITE ||
+        protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
+        protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+    const bool writable = protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+        protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+    const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+    return readable && (!require_write || writable) && begin + bytes <= region_end;
+}
+
+bool IsSaneMenuCarResourceNodeAddress(const void* node)
+{
+    // This traversal reads through node+0xC8. VirtualQuery makes the assertion
+    // catch invalid mapped/unmapped values as well as the observed low
+    // sentinel 0x0F without probing the address first.
+    return MenuCarMemoryRangeHasAccess(node, 0xCC, false);
+}
+
+bool __cdecl ValidateMenuCarResourceTraversalNode(
+    void* node,
+    DWORD depth,
+    const std::uint8_t* traversal_stack
+)
+{
+    if (IsSaneMenuCarResourceNodeAddress(node)) {
+        return true;
+    }
+
+    void* root = node;
+    void* parent = nullptr;
+    if (depth > 0 && depth <= 128 && traversal_stack != nullptr) {
+        // 0x0054D0B0 stores the root at local stack +0x14 on its first
+        // descent and the current parent at +0x10+depth*4. These are the
+        // same slots read by stock 0x0054D17A while unwinding.
+        root = *reinterpret_cast<void* const*>(traversal_stack + 0x14);
+        parent = *reinterpret_cast<void* const*>(traversal_stack + 0x10 + depth * sizeof(void*));
+    }
+
+    MenuCarSurfaceStorage* storage = nullptr;
+    const std::uintptr_t root_address = reinterpret_cast<std::uintptr_t>(root);
+    if (root_address >= kMenuCarNestedResourceOffset) {
+        auto* possible_owner = reinterpret_cast<void*>(root_address - kMenuCarNestedResourceOffset);
+        storage = FindMenuCarSurfaceStorage(possible_owner);
+    }
+
+    // This detour sits in a shared traversal routine. Preserve stock behavior
+    // for every caller except a menucar owner registered by the capacity
+    // patch; the dump-proven failure is inside that owner's +0xDA0 object.
+    if (storage == nullptr) {
+        return true;
+    }
+
+    const char* link = "unknown";
+    bool cleared = false;
+    if (parent != nullptr && MenuCarMemoryRangeHasAccess(parent, 0xCC, true)) {
+        auto** child = reinterpret_cast<void**>(static_cast<std::uint8_t*>(parent) + 0xC4);
+        auto** sibling = reinterpret_cast<void**>(static_cast<std::uint8_t*>(parent) + 0xC8);
+        if (*child == node) {
+            *child = nullptr;
+            link = "+0xC4 child";
+            cleared = true;
+        } else if (*sibling == node) {
+            *sibling = nullptr;
+            link = "+0xC8 sibling";
+            cleared = true;
+        }
+    }
+
+    if (!storage->resource_link_guard_logged) {
+        Log(
+            "*** WARNING *** MenuCarMaxSurfaces runtime reference guard at 0x0054D0D4 rejected node=0x%p depth=%lu root=0x%p parent=0x%p link=%s action=%s owner=0x%p. This is the detectable unpatched-reference assertion.",
+            node,
+            static_cast<unsigned long>(depth),
+            root,
+            parent,
+            link,
+            cleared ? "cleared-and-skipped" : "skipped",
+            storage->owner
+        );
+        storage->resource_link_guard_logged = true;
+    }
+    return false;
+}
+
+void __cdecl FinishMenuCarParse(void* owner)
+{
+    MenuCarSurfaceStorage* storage = FindMenuCarSurfaceStorage(owner);
+    const bool coverage_ok = g_menu_car_surface_hooks_installed &&
+        g_menu_car_static_reference_coverage_verified &&
+        MenuCarJumpTargets(0x004A4DFF, reinterpret_cast<const void*>(&MenuCarMaterialBeginHook4A4DFF)) &&
+        MenuCarJumpTargets(0x004A4E1F, reinterpret_cast<const void*>(&MenuCarMaterialLoopHook4A4E1F)) &&
+        MenuCarJumpTargets(0x004A537C, reinterpret_cast<const void*>(&MenuCarMaterialLinkHook4A537C)) &&
+        MenuCarJumpTargets(0x004A535B, reinterpret_cast<const void*>(&MenuCarSurfaceBeginHook4A535B)) &&
+        MenuCarJumpTargets(0x004A536F, reinterpret_cast<const void*>(&MenuCarSurfaceLoopHook4A536F)) &&
+        MenuCarJumpTargets(0x004A5604, reinterpret_cast<const void*>(&MenuCarSurfaceReaderHook4A5604)) &&
+        MenuCarJumpTargets(0x004A57CB, reinterpret_cast<const void*>(&MenuCarParseEndHook4A57CB)) &&
+        MenuCarJumpTargets(0x0054D0D4, reinterpret_cast<const void*>(&MenuCarResourceTraversalGuardHook54D0D4));
+
+    bool pointers_ok = storage != nullptr && storage->materials != nullptr && storage->records != nullptr;
+    if (pointers_ok) {
+        const std::uintptr_t material_begin = reinterpret_cast<std::uintptr_t>(storage->materials);
+        const std::uintptr_t material_end = material_begin +
+            static_cast<std::uintptr_t>(storage->material_retained_count) * kMenuCarMaterialRecordBytes;
+        for (DWORD index = 0; index < storage->retained_count; ++index) {
+            const auto* surface = storage->records + index * kMenuCarSurfaceRecordBytes;
+            const std::uintptr_t material = *reinterpret_cast<const std::uintptr_t*>(surface);
+            if (material < material_begin || material >= material_end ||
+                ((material - material_begin) % kMenuCarMaterialRecordBytes) != 0) {
+                pointers_ok = false;
+                break;
+            }
+        }
+    }
+
+    if (!coverage_ok || !pointers_ok) {
+        Log(
+            "*** WARNING *** MenuCarMaxSurfaces parse-end self-check FAILED for object=0x%p: hooks=%s material/surface pointers=%s. Rendering is not considered safe.",
+            owner,
+            coverage_ok ? "complete" : "INCOMPLETE",
+            pointers_ok ? "bounded" : "INVALID"
+        );
+        return;
+    }
+
+    if (!storage->parse_check_logged) {
+        Log(
+            "MenuCarMaxSurfaces: parse-end self-check passed for object=0x%p materials=%lu surfaces=%lu; all eight detours and static full-exe reference coverage are active",
+            owner,
+            static_cast<unsigned long>(storage->material_retained_count),
+            static_cast<unsigned long>(storage->retained_count)
+        );
+        storage->parse_check_logged = true;
+    }
+}
+
+__declspec(naked) void MenuCarMaterialBeginHook4A4DFF()
+{
+    __asm {
+        pushfd
+        pushad
+        push dword ptr [esp + 0x68]
+        push dword ptr [esp + 0x40]
+        call BeginMenuCarMaterialParse
+        add esp, 8
+        mov dword ptr [esp + 0x14], eax
+        popad
+        popfd
+
+        push 0x004A4E06
+        ret
+    }
+}
+
+__declspec(naked) void MenuCarMaterialLoopHook4A4E1F()
+{
+    __asm {
+        pushfd
+        pushad
+        push dword ptr [esp + 0x48]
+        call SelectMenuCarMaterialParseDestination
+        add esp, 4
+        mov dword ptr [esp + 0x04], eax
+        mov dword ptr [esp + 0x40], eax
+        popad
+        popfd
+
+        sub eax, edx
+        push 0x004A4E25
+        ret
+    }
+}
+
+__declspec(naked) void MenuCarMaterialLinkHook4A537C()
+{
+    __asm {
+        pushfd
+        pushad
+        mov eax, dword ptr [esp + 0x98]
+        mov ecx, dword ptr [esp + 0x3C]
+        push eax
+        push ecx
+        call ResolveMenuCarMaterialRecord
+        add esp, 8
+        mov dword ptr [esp + 0x18], eax
+        popad
+        popfd
+
+        mov esi, dword ptr [esp + 0x18]
+        mov dword ptr [edx - 0x0C], ecx
+        push 0x004A5391
+        ret
+    }
+}
+
+__declspec(naked) void MenuCarSurfaceBeginHook4A535B()
+{
+    __asm {
+        // Preserve the serialized count in EAX. At this site object is
+        // [ESP+0x18]; BeginMenuCarSurfaceParse returns record zero +0x0C.
+        push eax
+        push eax
+        push dword ptr [esp + 0x20]
+        call BeginMenuCarSurfaceParse
+        add esp, 8
+        mov ecx, eax
+        pop eax
+        mov dword ptr [esp + 0x1C], ecx
+
+        mov edx, 0x004A5369
+        jmp edx
+    }
+}
+
+__declspec(naked) void MenuCarSurfaceLoopHook4A536F()
+{
+    __asm {
+        // Select the configured heap slot, or the scratch record after the
+        // limit. Preserve the flags and registers that the two stolen MOVs
+        // would have left unchanged.
+        pushfd
+        pushad
+        push dword ptr [esp + 0x38]
+        call SelectMenuCarSurfaceParseDestination
+        add esp, 4
+        mov dword ptr [esp + 0x14], eax
+        mov dword ptr [esp + 0x40], eax
+        popad
+        popfd
+
+        mov esi, ebx
+        mov ecx, 7
+        push 0x004A5376
+        ret
+    }
+}
+
+__declspec(naked) void MenuCarSurfaceReaderHook4A5604()
+{
+    __asm {
+        // EAX is surface_id*0x34 and EDX is the menucar object. Convert the
+        // byte offset back to an ID before resolving the replacement record.
+        push ecx
+        push edx
+        mov ecx, 0x34
+        xor edx, edx
+        div ecx
+        push eax
+        push dword ptr [esp + 0x04]
+        call ResolveMenuCarSurfaceRecord
+        add esp, 8
+        pop edx
+        pop ecx
+
+        push 0x004A560B
+        ret
+    }
+}
+
+__declspec(naked) void MenuCarParseEndHook4A57CB()
+{
+    __asm {
+        pushfd
+        pushad
+        push eax
+        call FinishMenuCarParse
+        add esp, 4
+        popad
+        popfd
+
+        mov ecx, dword ptr [eax + 0x0D8C]
+        pop esi
+        push 0x004A57D2
+        ret
+    }
+}
+
+__declspec(naked) void MenuCarResourceTraversalGuardHook54D0D4()
+{
+    __asm {
+        // The observed crash reached stock 0x0054D0D4 with EBP=0x0F after
+        // following the menucar nested resource root's +0xC4 child link.
+        // Validate the node before replaying `test byte ptr [ebp+10h],4`.
+        pushfd
+        pushad
+        lea eax, [esp + 0x24]
+        push eax
+        push ebx
+        push ebp
+        call ValidateMenuCarResourceTraversalNode
+        add esp, 0x0C
+        mov dword ptr [esp + 0x1C], eax
+        popad
+        popfd
+
+        test eax, eax
+        jz invalid_node
+        test byte ptr [ebp + 0x10], 4
+        jnz stock_flag_set
+        push 0x0054D0DA
+        ret
+
+    stock_flag_set:
+        push 0x0054D14D
+        ret
+
+    invalid_node:
+        // Stock 0x0054D176 unwinds the saved parent and continues at its
+        // sibling, or exits when the bad node was already at depth zero.
+        push 0x0054D176
+        ret
+    }
+}
+
 __declspec(naked) void SplitscreenFilesystemHook520F7E()
 {
     __asm {
@@ -1705,7 +2505,6 @@ bool BeginVerticalHudPass()
     g_splitscreen_grid_hud_pass_active = IsLiveGridSplitscreenState();
     return g_splitscreen_vertical_hud_pass_active;
 }
-
 __declspec(naked) void SplitscreenHudBackgroundHook4B8CA0()
 {
     __asm {
@@ -1716,7 +2515,9 @@ __declspec(naked) void SplitscreenHudBackgroundHook4B8CA0()
         jz normal
         popad
         popfd
-        // Skip the complete two-entry BGBar loop for a live vertical HUD.
+        // The two stock BGBar draws are intentionally skipped in vertical
+        // mode. They are batched before POSITION text but overlap it visually
+        // when both viewport HUD passes share the top anchor.
         push 0x004B8E7B
         ret
     normal:
@@ -3112,6 +3913,225 @@ bool PatchSplitscreenFix(const ModuleRange& range)
     return true;
 }
 
+bool PatchMenuCarAllocationOperand(
+    const char* label,
+    std::uintptr_t operand_address,
+    DWORD stock_size,
+    DWORD configured_size
+)
+{
+    auto* operand = reinterpret_cast<std::uint8_t*>(operand_address);
+    DWORD actual_size = 0;
+    std::memcpy(&actual_size, operand, sizeof(actual_size));
+
+    if (actual_size != stock_size) {
+        char actual[32] = {};
+        FormatBytes(operand, sizeof(actual_size), actual, sizeof(actual));
+        Log(
+            "%s: allocation operand mismatch at 0x%08lX actual=%s",
+            label,
+            static_cast<unsigned long>(operand_address),
+            actual
+        );
+        return false;
+    }
+
+    if (configured_size == stock_size) {
+        Log(
+            "%s: stock allocation retained at 0x%08lX (%lu bytes)",
+            label,
+            static_cast<unsigned long>(operand_address),
+            static_cast<unsigned long>(stock_size)
+        );
+        return true;
+    }
+
+    const bool ok = WriteMemory(operand, &configured_size, sizeof(configured_size));
+    Log(
+        "%s: %s allocation operand at 0x%08lX (%lu -> %lu bytes)",
+        label,
+        ok ? "applied" : "failed to patch",
+        static_cast<unsigned long>(operand_address),
+        static_cast<unsigned long>(stock_size),
+        static_cast<unsigned long>(configured_size)
+    );
+    return ok;
+}
+
+bool PatchMenuCarFileSizeLimits()
+{
+    // ZPatchFO2 v2.4 patches exactly these two PUSH imm32 operands in the
+    // menu-preview object constructor. The adjacent object fields retain
+    // their stock values in the original implementation as well.
+    const bool model_ok = PatchMenuCarAllocationOperand(
+        "MenuCarMaxModelFileSize",
+        0x004ABAD1,
+        0x00080000,
+        g_menu_car_max_model_file_size
+    );
+    const bool skin_ok = PatchMenuCarAllocationOperand(
+        "MenuCarMaxSkinFileSize",
+        0x004ABAEB,
+        0x00200000,
+        g_menu_car_max_skin_file_size
+    );
+    return model_ok && skin_ok;
+}
+
+bool PatchMenuCarSurfaceLimit(const ModuleRange& range)
+{
+    g_menu_car_surface_hooks_installed = false;
+    g_menu_car_static_reference_coverage_verified = false;
+    if (g_menu_car_max_surfaces == kVanillaMenuCarSurfaceCapacity) {
+        Log("MenuCarMaxSurfaces: stock 16 material/16 surface embedded arrays retained; hooks inactive");
+        return true;
+    }
+
+    if (reinterpret_cast<std::uintptr_t>(range.base) != 0x00400000 || range.size != 0x00541000) {
+        Log(
+            "MenuCarMaxSurfaces: unsupported executable layout base=0x%p size=0x%lX",
+            range.base,
+            static_cast<unsigned long>(range.size)
+        );
+        return false;
+    }
+
+    const std::uint8_t material_begin_expected[] = {
+        0x8B, 0x54, 0x24, 0x18,
+        0x83, 0xC2, 0x20
+    };
+    const std::uint8_t material_loop_expected[] = {
+        0x8B, 0x74, 0x24, 0x1C,
+        0x2B, 0xC2
+    };
+    const std::uint8_t material_link_expected[] = {
+        0x8B, 0x4C, 0x24, 0x74,
+        0x8B, 0x74, 0x24, 0x18,
+        0x8D, 0x0C, 0x89,
+        0xC1, 0xE1, 0x05,
+        0x8D, 0x4C, 0x31, 0x20,
+        0x89, 0x4A, 0xF4
+    };
+    const std::uint8_t begin_expected[] = {
+        0x8B, 0x4C, 0x24, 0x18,
+        0x81, 0xC1, 0x2C, 0x0A, 0x00, 0x00,
+        0x89, 0x4C, 0x24, 0x1C
+    };
+    const std::uint8_t loop_expected[] = {
+        0x8B, 0xF3,
+        0xB9, 0x07, 0x00, 0x00, 0x00
+    };
+    const std::uint8_t reader_expected[] = {
+        0x8D, 0x84, 0x10, 0x20, 0x0A, 0x00, 0x00
+    };
+    const std::uint8_t parse_end_expected[] = {
+        0x8B, 0x88, 0x8C, 0x0D, 0x00, 0x00,
+        0x5E
+    };
+    const std::uint8_t resource_guard_expected[] = {
+        0xF6, 0x45, 0x10, 0x04,
+        0x75, 0x73
+    };
+
+    struct MenuCarPatchSite
+    {
+        std::uint8_t* address;
+        const std::uint8_t* expected;
+        size_t size;
+        void* hook;
+        const char* label;
+    };
+
+    // Consumers and the parse-end auditor are installed before parser entry
+    // points. All signatures are validated before the first executable write.
+    const MenuCarPatchSite sites[] = {
+        {reinterpret_cast<std::uint8_t*>(0x0054D0D4), resource_guard_expected, sizeof(resource_guard_expected), reinterpret_cast<void*>(&MenuCarResourceTraversalGuardHook54D0D4), "resource-tree-invalid-link-guard"},
+        {reinterpret_cast<std::uint8_t*>(0x004A537C), material_link_expected, sizeof(material_link_expected), reinterpret_cast<void*>(&MenuCarMaterialLinkHook4A537C), "surface-to-material-link"},
+        {reinterpret_cast<std::uint8_t*>(0x004A5604), reader_expected, sizeof(reader_expected), reinterpret_cast<void*>(&MenuCarSurfaceReaderHook4A5604), "model-surface-resolver"},
+        {reinterpret_cast<std::uint8_t*>(0x004A57CB), parse_end_expected, sizeof(parse_end_expected), reinterpret_cast<void*>(&MenuCarParseEndHook4A57CB), "parse-end-self-check"},
+        {reinterpret_cast<std::uint8_t*>(0x004A4E1F), material_loop_expected, sizeof(material_loop_expected), reinterpret_cast<void*>(&MenuCarMaterialLoopHook4A4E1F), "material-parser-loop"},
+        {reinterpret_cast<std::uint8_t*>(0x004A536F), loop_expected, sizeof(loop_expected), reinterpret_cast<void*>(&MenuCarSurfaceLoopHook4A536F), "surface-parser-loop"},
+        {reinterpret_cast<std::uint8_t*>(0x004A4DFF), material_begin_expected, sizeof(material_begin_expected), reinterpret_cast<void*>(&MenuCarMaterialBeginHook4A4DFF), "material-parser-begin"},
+        {reinterpret_cast<std::uint8_t*>(0x004A535B), begin_expected, sizeof(begin_expected), reinterpret_cast<void*>(&MenuCarSurfaceBeginHook4A535B), "surface-parser-begin"},
+    };
+
+    for (const MenuCarPatchSite& site : sites) {
+        if (std::memcmp(site.address, site.expected, site.size) != 0) {
+            char actual[96] = {};
+            FormatBytes(site.address, site.size, actual, sizeof(actual));
+            Log(
+                "MenuCarMaxSurfaces: signature mismatch for %s at 0x%p actual=%s; no hooks installed",
+                site.label,
+                site.address,
+                actual
+            );
+            return false;
+        }
+    }
+
+    if (!VerifyMenuCarStaticReferenceCoverage()) {
+        return false;
+    }
+    g_menu_car_static_reference_coverage_verified = true;
+
+    size_t installed = 0;
+    for (; installed < sizeof(sites) / sizeof(sites[0]); ++installed) {
+        const MenuCarPatchSite& site = sites[installed];
+        if (!WriteJump(site.address, site.hook, site.size) ||
+            !MenuCarJumpTargets(reinterpret_cast<std::uintptr_t>(site.address), site.hook)) {
+            Log("MenuCarMaxSurfaces: failed to install/verify %s; rolling back", site.label);
+            if (std::memcmp(site.address, site.expected, site.size) != 0) {
+                WriteMemory(site.address, site.expected, site.size);
+            }
+            break;
+        }
+    }
+
+    if (installed != sizeof(sites) / sizeof(sites[0])) {
+        while (installed > 0) {
+            --installed;
+            const MenuCarPatchSite& site = sites[installed];
+            WriteMemory(site.address, site.expected, site.size);
+        }
+        return false;
+    }
+
+    g_menu_car_surface_hooks_installed = true;
+    Log(
+        "MenuCarMaxSurfaces: applied complete material+surface heap redirect with capacity %lu; parser/link sites=0x004A4DFF,0x004A4E1F,0x004A537C,0x004A535B,0x004A536F,0x004A5604,0x004A57CB; invalid nested-resource link guard=0x0054D0D4",
+        static_cast<unsigned long>(g_menu_car_max_surfaces)
+    );
+    return true;
+}
+
+bool PatchMenuCarBackfaceCulling()
+{
+    auto* hook_address = reinterpret_cast<std::uint8_t*>(0x005AACB0);
+    const std::uint8_t expected[] = {
+        0x8B, 0x01,
+        0x6A, 0x03,
+        0xFF, 0x50, 0x5C
+    };
+
+    if (std::memcmp(hook_address, expected, sizeof(expected)) == 0) {
+        const bool ok = WriteJump(
+            hook_address,
+            reinterpret_cast<void*>(&MenuCarBackfaceCullingHook5AACB0),
+            sizeof(expected)
+        );
+        Log(
+            "MenuCarBackfaceCulling: %s D3DRS_CULLMODE hook at 0x005AACB0",
+            ok ? "applied" : "failed to patch"
+        );
+        return ok;
+    }
+
+    char actual[48] = {};
+    FormatBytes(hook_address, sizeof(expected), actual, sizeof(actual));
+    Log("MenuCarBackfaceCulling: hook mismatch at 0x005AACB0 actual=%s", actual);
+    return false;
+}
+
 bool ModuleRvaContains(const ModuleRange& range, DWORD rva, size_t size)
 {
     return range.base != nullptr && rva <= range.size && size <= range.size - rva;
@@ -3515,7 +4535,7 @@ void ApplyPatches()
     const ModuleRange exe = GetExeRange();
     Log("FO2 ZPatch reimplementation attached: exe=0x%p size=0x%lX", exe.base, static_cast<unsigned long>(exe.size));
     Log(
-        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d SplitscreenLayoutState=%s SplitscreenPostProcessingFix=%d SplitscreenZoomInputFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu",
+        "Config: Log=%d SkipLicenseScreen=%d SkipIntro=%d UncapFPS=%d FramePacingFix=%d RemoveVSync=%d BorderlessWindowed=%d WidescreenFix=%d FOVScaling=%d SplitscreenFix=%d SplitscreenLayoutState=%s SplitscreenPostProcessingFix=%d SplitscreenZoomInputFix=%d MenuCarBackfaceCulling=%d MenuCarModelMax=%lu MenuCarSkinMax=%lu MenuCarMaxSurfaces=%lu",
         g_log_enabled ? 1 : 0,
         g_skip_license_screen ? 1 : 0,
         g_skip_intro ? 1 : 0,
@@ -3531,7 +4551,8 @@ void ApplyPatches()
         g_splitscreen_zoom_input_fix ? 1 : 0,
         g_menu_car_backface_culling ? 1 : 0,
         static_cast<unsigned long>(g_menu_car_max_model_file_size),
-        static_cast<unsigned long>(g_menu_car_max_skin_file_size)
+        static_cast<unsigned long>(g_menu_car_max_skin_file_size),
+        static_cast<unsigned long>(g_menu_car_max_surfaces)
     );
 
     if (g_splitscreen_fix) {
@@ -3547,7 +4568,6 @@ void ApplyPatches()
             PatchSplitscreenZoomInputFix();
         }
     }
-
     if (g_skip_license_screen) {
         PatchSkipLicenseScreen();
     }
@@ -3560,6 +4580,11 @@ void ApplyPatches()
     }
     if (g_uncap_fps) {
         PatchUncapFPS(exe);
+    }
+    PatchMenuCarFileSizeLimits();
+    PatchMenuCarSurfaceLimit(exe);
+    if (g_menu_car_backface_culling) {
+        PatchMenuCarBackfaceCulling();
     }
     if (g_widescreen_fix) {
         PatchWidescreenFix();
